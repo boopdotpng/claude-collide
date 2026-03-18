@@ -1,0 +1,13 @@
+[Unit]
+Description=Tenstorrent device queue — serializes hardware access
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/tenstorrent/tt-device-queue/server.py
+Restart=on-failure
+RestartSec=2
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
+
+[Install]
+WantedBy=default.target

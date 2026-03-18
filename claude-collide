@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""
+claude-collide — submit commands to the tt-device-queue server.
+
+Usage:
+  claude-collide queue <command...>                Submit a job, return immediately
+  claude-collide result <job_id>                   Check if a job is done
+  claude-collide exec <command...>                 Submit + block until done
+  claude-collide status                            Show queue status
+  claude-collide reset                             Queue a device reset (tt-smi -r)
+
+Options (before subcommand):
+  --timeout N     Execution timeout in seconds (default: 120)
+  --agent NAME    Tag this job (default: $TT_AGENT or pid-$$)
+  --port PORT     Server port (default: 5741)
+
+Examples:
+  claude-collide queue PYTHONPATH=. uv run examples/matmul_peak.py
+  claude-collide result a1b2c3d4
+  claude-collide exec PYTHONPATH=. uv run examples/matmul_peak.py
+  claude-collide status
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
+DEFAULT_TIMEOUT = 120
+AGENT = os.environ.get("TT_AGENT", f"pid-{os.getpid()}")
+BASE = f"http://{HOST}:{PORT}"
+
+
+def http_post(path, data):
+  body = json.dumps(data).encode()
+  req = urllib.request.Request(
+    f"{BASE}{path}", data=body,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+      return json.loads(resp.read()), resp.status
+  except urllib.error.HTTPError as e:
+    return json.loads(e.read()), e.code
+  except urllib.error.URLError:
+    print("ERROR: tt-device-queue server is not running.", file=sys.stderr)
+    print(f"Start it: python ~/tenstorrent/tt-device-queue/server.py &", file=sys.stderr)
+    sys.exit(1)
+
+
+def http_get(path):
+  try:
+    with urllib.request.urlopen(f"{BASE}{path}", timeout=10) as resp:
+      return json.loads(resp.read()), resp.status
+  except urllib.error.HTTPError as e:
+    return json.loads(e.read()), e.code
+  except urllib.error.URLError:
+    print("ERROR: tt-device-queue server is not running.", file=sys.stderr)
+    print(f"Start it: python ~/tenstorrent/tt-device-queue/server.py &", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_queue(cmd: str, timeout: int, agent: str, cwd: str):
+  data, code = http_post("/queue", {
+    "cmd": cmd, "cwd": cwd, "timeout": timeout, "agent": agent,
+  })
+  if code != 200:
+    print(f"ERROR: {data.get('error', 'unknown')}", file=sys.stderr)
+    sys.exit(1)
+
+  print(f"job_id={data['job_id']}")
+  print(f"output_file={data['output_file']}")
+  print(f"position={data['position']}")
+  print(f"estimated_wait_sec={data['estimated_wait_sec']}")
+
+
+def cmd_result(job_id: str):
+  data, code = http_get(f"/result/{job_id}")
+  if code == 404:
+    print(f"ERROR: {data.get('error', 'unknown job')}", file=sys.stderr)
+    sys.exit(1)
+
+  if data["status"] == "done":
+    print(f"status=done")
+    print(f"exit_code={data['exit_code']}")
+    print(f"output_file={data['output_file']}")
+    print(f"elapsed={data['elapsed']}")
+  else:
+    print(f"status={data['status']}")
+    print(f"position={data.get('position', '?')}")
+    print(f"estimated_wait_sec={data.get('estimated_wait_sec', '?')}")
+
+
+def cmd_exec(cmd: str, timeout: int, agent: str, cwd: str):
+  """Submit, poll until done, print result."""
+  data, code = http_post("/queue", {
+    "cmd": cmd, "cwd": cwd, "timeout": timeout, "agent": agent,
+  })
+  if code != 200:
+    print(f"ERROR: {data.get('error', 'unknown')}", file=sys.stderr)
+    sys.exit(1)
+
+  job_id = data["job_id"]
+  output_file = data["output_file"]
+  wait = data["estimated_wait_sec"]
+
+  if wait > 0:
+    print(f"[claude-collide] Queued (position {data['position']}, ~{wait}s wait)", file=sys.stderr)
+
+  # Poll until done
+  while True:
+    if wait > 0:
+      time.sleep(min(wait, 5))
+    else:
+      time.sleep(2)
+
+    result, _ = http_get(f"/result/{job_id}")
+
+    if result["status"] == "done":
+      print(f"exit_code={result['exit_code']}")
+      print(f"output_file={result['output_file']}")
+      print(f"elapsed={result['elapsed']}")
+
+      # Print a short tail of the output for immediate feedback
+      try:
+        with open(output_file, "r") as f:
+          lines = f.readlines()
+          tail = lines[-20:] if len(lines) > 20 else lines
+          if len(lines) > 20:
+            print(f"... ({len(lines) - 20} lines truncated, see {output_file})", file=sys.stderr)
+          for line in tail:
+            sys.stdout.write(line)
+      except FileNotFoundError:
+        pass
+
+      sys.exit(0 if result["exit_code"] == 0 else 1)
+    else:
+      wait = result.get("estimated_wait_sec", 5)
+      print(f"[claude-collide] Still {result['status']} (position {result.get('position', '?')}, ~{wait}s)", file=sys.stderr)
+
+
+def cmd_status():
+  data, code = http_get("/status")
+  current = data.get("current")
+  pending = data.get("pending", [])
+  recent = data.get("recent", [])
+
+  if current:
+    print(f"RUNNING: [{current['id']}] {current['cmd']}")
+    print(f"         agent={current['agent']}  {current['running_sec']}s")
+  else:
+    print("RUNNING: (idle)")
+
+  if pending:
+    print(f"\nQUEUED ({len(pending)}):")
+    for p in pending:
+      print(f"  [{p['id']}] {p['cmd']}")
+      print(f"           agent={p['agent']}  waiting {p['waiting_sec']}s")
+  else:
+    print("\nQUEUED: (empty)")
+
+  if recent:
+    print(f"\nRECENT:")
+    for r in recent:
+      tag = "OK" if r.get("exit_code", 1) == 0 else f"FAIL({r.get('exit_code')})"
+      print(f"  [{r['id']}] {tag} {r.get('elapsed', '?')}s  {r['cmd']}")
+
+
+def cmd_reset(agent: str):
+  data, code = http_post("/queue", {
+    "cmd": "tt-smi -r", "cwd": "", "timeout": 30, "agent": f"{agent}/reset",
+  })
+  if code != 200:
+    print(f"ERROR: {data.get('error', 'unknown')}", file=sys.stderr)
+    sys.exit(1)
+  print(f"job_id={data['job_id']}")
+  print(f"position={data['position']}")
+  print(f"estimated_wait_sec={data['estimated_wait_sec']}")
+
+
+def main():
+  argv = sys.argv[1:]
+  timeout = DEFAULT_TIMEOUT
+  agent = AGENT
+
+  # Parse global options
+  while argv and argv[0].startswith("--"):
+    if argv[0] == "--timeout" and len(argv) > 1:
+      timeout = int(argv[1])
+      argv = argv[2:]
+    elif argv[0] == "--agent" and len(argv) > 1:
+      agent = argv[1]
+      argv = argv[2:]
+    elif argv[0] == "--port" and len(argv) > 1:
+      global PORT, BASE
+      PORT = int(argv[1])
+      BASE = f"http://{HOST}:{PORT}"
+      argv = argv[2:]
+    elif argv[0] in ("--help", "-h"):
+      print(__doc__.strip())
+      sys.exit(0)
+    else:
+      break
+
+  if not argv:
+    print(__doc__.strip())
+    sys.exit(1)
+
+  subcmd = argv[0]
+  rest = argv[1:]
+
+  if subcmd == "queue":
+    if not rest:
+      print("Usage: claude-collide queue <command...>", file=sys.stderr)
+      sys.exit(1)
+    cmd_queue(" ".join(rest), timeout, agent, os.getcwd())
+
+  elif subcmd == "result":
+    if not rest:
+      print("Usage: claude-collide result <job_id>", file=sys.stderr)
+      sys.exit(1)
+    cmd_result(rest[0])
+
+  elif subcmd == "exec":
+    if not rest:
+      print("Usage: claude-collide exec <command...>", file=sys.stderr)
+      sys.exit(1)
+    cmd_exec(" ".join(rest), timeout, agent, os.getcwd())
+
+  elif subcmd == "status":
+    cmd_status()
+
+  elif subcmd == "reset":
+    cmd_reset(agent)
+
+  else:
+    print(f"Unknown subcommand: {subcmd}", file=sys.stderr)
+    print(__doc__.strip())
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+  main()
