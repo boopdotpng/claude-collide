@@ -13,11 +13,12 @@ Options (before subcommand):
   --timeout N     Execution timeout in seconds (default: 120)
   --agent NAME    Tag this job (default: $TT_AGENT or pid-$$)
   --port PORT     Server port (default: 5741)
+  --cwd DIR       Working directory for the command (default: current directory)
 
 Examples:
-  claude-collide queue PYTHONPATH=. uv run examples/matmul_peak.py
+  claude-collide --cwd ~/tenstorrent/blackhole-py queue PYTHONPATH=. uv run examples/matmul_peak.py
   claude-collide result a1b2c3d4
-  claude-collide exec PYTHONPATH=. uv run examples/matmul_peak.py
+  claude-collide --cwd ~/tenstorrent/blackhole-py exec PYTHONPATH=. uv run examples/matmul_peak.py
   claude-collide status
 """
 
@@ -188,8 +189,10 @@ def main():
   timeout = DEFAULT_TIMEOUT
   agent = AGENT
 
+  cwd = None
+
   # Parse global options
-  while argv and argv[0].startswith("--"):
+  while argv and (argv[0].startswith("--") or argv[0] in ("-h",)):
     if argv[0] == "--timeout" and len(argv) > 1:
       timeout = int(argv[1])
       argv = argv[2:]
@@ -200,6 +203,9 @@ def main():
       global PORT, BASE
       PORT = int(argv[1])
       BASE = f"http://{HOST}:{PORT}"
+      argv = argv[2:]
+    elif argv[0] == "--cwd" and len(argv) > 1:
+      cwd = os.path.expanduser(argv[1])
       argv = argv[2:]
     elif argv[0] in ("--help", "-h"):
       print(__doc__.strip())
@@ -214,11 +220,13 @@ def main():
   subcmd = argv[0]
   rest = argv[1:]
 
+  effective_cwd = cwd or os.getcwd()
+
   if subcmd == "queue":
     if not rest:
       print("Usage: claude-collide queue <command...>", file=sys.stderr)
       sys.exit(1)
-    cmd_queue(" ".join(rest), timeout, agent, os.getcwd())
+    cmd_queue(" ".join(rest), timeout, agent, effective_cwd)
 
   elif subcmd == "result":
     if not rest:
@@ -230,7 +238,7 @@ def main():
     if not rest:
       print("Usage: claude-collide exec <command...>", file=sys.stderr)
       sys.exit(1)
-    cmd_exec(" ".join(rest), timeout, agent, os.getcwd())
+    cmd_exec(" ".join(rest), timeout, agent, effective_cwd)
 
   elif subcmd == "status":
     cmd_status()

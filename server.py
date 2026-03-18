@@ -31,7 +31,7 @@ HOST = os.environ.get("TT_DEVICE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 DEFAULT_TIMEOUT = int(os.environ.get("TT_DEVICE_TIMEOUT", "120"))
 LOG_DIR = Path(os.environ.get("TT_DEVICE_LOG_DIR", "/tmp/tt-device-logs"))
-ESTIMATE_PER_JOB = 15  # seconds assumed per queued job
+ESTIMATE_PER_JOB = 10  # seconds assumed per queued job
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -61,7 +61,8 @@ class DeviceQueue:
     self._history: list[dict] = []
     self._lock = threading.Lock()
 
-  def submit(self, cmd: str, cwd: str, timeout: int, agent: str) -> Job:
+  def submit(self, cmd: str, cwd: str, timeout: int, agent: str) -> tuple["Job", int, int]:
+    """Submit a job. Returns (job, position, estimated_wait_sec) computed atomically."""
     job_id = uuid.uuid4().hex[:8]
     output_dir = LOG_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -75,9 +76,12 @@ class DeviceQueue:
     with self._lock:
       self._jobs[job_id] = job
       self._pending_ids.append(job_id)
+      # Compute position while still holding the lock, before the worker can dequeue
+      pos = self._pending_ids.index(job_id)
+      jobs_ahead = pos + (1 if self._current else 0)
 
     self._queue.put(job)
-    return job
+    return job, jobs_ahead, jobs_ahead * ESTIMATE_PER_JOB
 
   def get_job(self, job_id: str) -> Job | None:
     return self._jobs.get(job_id)
@@ -254,22 +258,18 @@ class Handler(BaseHTTPRequestHandler):
         self._json_response(400, {"error": "Missing 'cmd'"})
         return
 
-      job = dq.submit(
+      job, jobs_ahead, wait_sec = dq.submit(
         cmd=cmd,
         cwd=body.get("cwd", ""),
         timeout=body.get("timeout", DEFAULT_TIMEOUT),
         agent=body.get("agent", "unknown"),
       )
 
-      pos = dq.position_of(job.id)
-      # pos is 0-indexed in pending list; add 1 for the currently running job if any
-      jobs_ahead = pos + (1 if dq._current else 0)
-
       self._json_response(200, {
         "job_id": job.id,
         "output_file": job.output_file,
         "position": jobs_ahead,
-        "estimated_wait_sec": jobs_ahead * ESTIMATE_PER_JOB,
+        "estimated_wait_sec": wait_sec,
       })
       return
 
