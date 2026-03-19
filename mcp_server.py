@@ -107,14 +107,24 @@ async def device_submit(
     timeout: int = DEFAULT_TIMEOUT,
     agent: str = AGENT,
 ) -> str:
-    """Submit a command to the Tenstorrent device queue. Returns immediately with
-    a job_id. The command will run when its turn comes in the FIFO queue.
+    """Submit a command to the device queue. Returns immediately with a job_id.
+    The command will execute when its turn comes in the FIFO queue.
 
-    Call device_result(job_id) later to get the output. This lets you do other
-    work (read files, write code, plan) while the device job runs.
+    IMPORTANT: Use this (or device_run) instead of Bash for ANY command that
+    touches the shared device — running scripts, tests, benchmarks, firmware
+    flashing, etc. Do NOT use Bash directly for device commands. The queue
+    ensures only one command runs at a time and prevents device conflicts
+    between concurrent agents.
+
+    This is the async version: you get the job_id back immediately and can
+    continue doing other work (reading files, writing code, planning) while
+    the command runs. Call device_result(job_id) when you need the output.
+
+    If you have nothing else to do while waiting, use device_run() instead
+    which submits and waits in one call.
 
     Args:
-        cmd: Shell command to run (e.g. "PYTHONPATH=. uv run examples/matmul.py")
+        cmd: Shell command to run (e.g. "pytest tests/" or "python train.py")
         cwd: Working directory for the command
         timeout: Max execution time in seconds (default 120)
         agent: Tag identifying this agent (default "mcp-server")
@@ -135,10 +145,12 @@ async def device_submit(
 
 @server.tool()
 async def device_result(job_id: str) -> str:
-    """Wait for a device job to finish and return its full output.
+    """Wait for a previously submitted device job to finish and return its
+    full output. Blocks until the job completes.
 
-    Blocks until the job completes — only call this when you actually need the
-    result. If you have other work to do, do it before calling this.
+    Only call this when you actually need the result. If you have other work
+    to do (reading files, writing code, planning next steps), do that first
+    and call this after — the job runs in the background regardless.
 
     Args:
         job_id: The job_id returned by device_submit()
@@ -167,14 +179,22 @@ async def device_run(
     timeout: int = DEFAULT_TIMEOUT,
     agent: str = AGENT,
 ) -> str:
-    """Submit a command and wait for it to complete. Returns the full output.
+    """Submit a command to the device queue and wait for it to complete.
+    Returns the full output.
 
-    This is a convenience tool that combines device_submit + device_result.
+    IMPORTANT: Use this (or device_submit) instead of Bash for ANY command
+    that touches the shared device — running scripts, tests, benchmarks,
+    firmware flashing, etc. Do NOT use Bash directly for device commands.
+    The queue ensures only one command runs at a time and prevents device
+    conflicts between concurrent agents.
+
+    This is the blocking version — it submits and waits in one call.
     Use this when you have nothing else to do while waiting. If you want to
-    do other work while the command runs, use device_submit() instead.
+    do other work while the command runs, use device_submit() instead and
+    call device_result() later.
 
     Args:
-        cmd: Shell command to run
+        cmd: Shell command to run (e.g. "pytest tests/" or "python train.py")
         cwd: Working directory for the command
         timeout: Max execution time in seconds (default 120)
         agent: Tag identifying this agent (default "mcp-server")
@@ -204,7 +224,9 @@ async def device_run(
 
 @server.tool()
 async def device_status() -> str:
-    """Show what's currently running, queued, and recently completed on the device."""
+    """Show what's currently running, queued, and recently completed on the device.
+    Use this to check if the device is busy before submitting work, or to see
+    the history of recent jobs."""
     async with httpx.AsyncClient() as client:
         data = await _get(client, "/status")
 
@@ -238,8 +260,10 @@ async def device_status() -> str:
 
 @server.tool()
 async def device_reset(agent: str = AGENT) -> str:
-    """Queue a device reset (tt-smi -r). Returns immediately — the reset runs
-    when its turn comes in the queue.
+    """Queue a device reset (tt-smi -r). Returns immediately — the reset
+    runs when its turn comes in the queue. Use this when the device is in a
+    bad state (hangs, errors, firmware issues). Call device_result(job_id)
+    afterward to confirm the reset completed successfully.
 
     Args:
         agent: Tag identifying this agent
