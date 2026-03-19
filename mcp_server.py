@@ -250,30 +250,39 @@ async def device_status() -> str:
     return "\n".join(lines)
 
 
+TT_SMI = os.path.expanduser("~/tenstorrent/.venv/bin/tt-smi")
+
+
 @server.tool()
-async def device_reset(agent: str = AGENT) -> str:
-    """Queue a device reset (tt-smi -r). Returns immediately — the reset
-    runs when its turn comes in the queue. Use this when the device is in a
-    bad state (hangs, errors, firmware issues). Call device_result(job_id)
-    afterward to confirm the reset completed successfully.
+async def device_reset(device: int = 0, agent: str = AGENT) -> str:
+    """Reset the Tenstorrent device via tt-smi. Queued through the FIFO like
+    any other command — waits for running jobs to finish first, then resets.
+
+    Use this when the device is in a bad state (hangs, errors, firmware
+    issues, NaN outputs). Blocks until the reset completes.
 
     Args:
+        device: Device number to reset (default 0)
         agent: Tag identifying this agent
     """
+    cmd = f"{TT_SMI} -r {device}"
     async with httpx.AsyncClient() as client:
-        result = await _post(client, "/queue", {
-            "cmd": "tt-smi -r",
-            "cwd": "",
-            "timeout": 30,
-            "agent": f"{agent}/reset",
+        submit_result = await _post(client, "/queue", {
+            "cmd": cmd, "cwd": "", "timeout": 30, "agent": f"{agent}/reset",
         })
+        job_id = submit_result["job_id"]
+        result = await _wait_for_job(client, job_id)
 
-    return json.dumps({
-        "job_id": result["job_id"],
-        "position": result["position"],
-        "estimated_wait_sec": result["estimated_wait_sec"],
-        "hint": "Reset has been queued. Call device_result(job_id) to confirm it completed.",
-    }, indent=2)
+    exit_code = result["exit_code"]
+    status = "OK" if exit_code == 0 else f"FAILED (exit code {exit_code})"
+
+    lines = [
+        f"Reset device {device}: {status}",
+        f"Elapsed: {result['elapsed']}s",
+        "",
+        result["output"],
+    ]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
