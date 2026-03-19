@@ -80,7 +80,12 @@ async def _get(client: httpx.AsyncClient, path: str) -> dict:
 
 
 async def _wait_for_job(client: httpx.AsyncClient, job_id: str) -> dict:
-    """Poll until the job is done. Returns the full result with output contents."""
+    """Poll until the job is done. Returns the full result with output contents.
+
+    Uses fast initial polls (50ms) to catch instant failures, then backs off
+    to POLL_INTERVAL (500ms) for longer-running jobs.
+    """
+    interval = 0.05  # start fast for instant failures
     while True:
         result = await _get(client, f"/result/{job_id}")
         if result["status"] == "done":
@@ -99,7 +104,8 @@ async def _wait_for_job(client: httpx.AsyncClient, job_id: str) -> dict:
                 "output_file": output_file,
                 "output": output_text,
             }
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(interval)
+        interval = min(interval * 2, POLL_INTERVAL)  # backoff to 500ms
 
 
 @server.tool()
