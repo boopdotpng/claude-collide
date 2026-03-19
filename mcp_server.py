@@ -35,12 +35,14 @@ AGENT = os.environ.get("TT_AGENT", "mcp-server")
 POLL_INTERVAL = 0.5
 
 server = FastMCP(
-    "tt-device-queue",
+    "claude-collide",
     instructions=(
-        "Tools for running commands on the Tenstorrent device. "
-        "The device can only run one command at a time — commands are queued FIFO. "
-        "Use device_submit() to enqueue, then do other work, then call device_result() "
-        "when you need the output. Or use device_run() to submit and wait in one shot."
+        "FIFO queue for commands that touch the GPU/device. Other agents may be "
+        "using the device concurrently — all device commands MUST go through these "
+        "tools, never through Bash directly. This includes: running Python scripts "
+        "that use the device (ttnn, tt-metal, CUDA, etc.), pytest/tests that touch "
+        "hardware, benchmarks, tt-smi, firmware tools, and anything that could "
+        "conflict with another agent's device access."
     ),
 )
 
@@ -107,27 +109,21 @@ async def device_submit(
     timeout: int = DEFAULT_TIMEOUT,
     agent: str = AGENT,
 ) -> str:
-    """Submit a command to the device queue. Returns immediately with a job_id.
-    The command will execute when its turn comes in the FIFO queue.
+    """Submit a command to the device queue and return immediately with a job_id.
 
-    IMPORTANT: Use this (or device_run) instead of Bash for ANY command that
-    touches the shared device — running scripts, tests, benchmarks, firmware
-    flashing, etc. Do NOT use Bash directly for device commands. The queue
-    ensures only one command runs at a time and prevents device conflicts
-    between concurrent agents.
+    Use this instead of Bash for ANY command that uses the GPU/device (python
+    scripts using ttnn/tt-metal/CUDA, pytest, benchmarks, tt-smi, etc.). Other
+    agents may be using the device — the queue prevents conflicts.
 
-    This is the async version: you get the job_id back immediately and can
-    continue doing other work (reading files, writing code, planning) while
-    the command runs. Call device_result(job_id) when you need the output.
-
-    If you have nothing else to do while waiting, use device_run() instead
-    which submits and waits in one call.
+    Returns immediately. Call device_result(job_id) when you need the output.
+    Do other work (read files, write code, plan) in the meantime. If you have
+    nothing else to do, use device_run() instead.
 
     Args:
         cmd: Shell command to run (e.g. "pytest tests/" or "python train.py")
         cwd: Working directory for the command
         timeout: Max execution time in seconds (default 120)
-        agent: Tag identifying this agent (default "mcp-server")
+        agent: Tag identifying this agent
     """
     async with httpx.AsyncClient() as client:
         result = await _post(client, "/queue", {
@@ -180,24 +176,20 @@ async def device_run(
     agent: str = AGENT,
 ) -> str:
     """Submit a command to the device queue and wait for it to complete.
-    Returns the full output.
 
-    IMPORTANT: Use this (or device_submit) instead of Bash for ANY command
-    that touches the shared device — running scripts, tests, benchmarks,
-    firmware flashing, etc. Do NOT use Bash directly for device commands.
-    The queue ensures only one command runs at a time and prevents device
-    conflicts between concurrent agents.
+    Use this instead of Bash for ANY command that uses the GPU/device (python
+    scripts using ttnn/tt-metal/CUDA, pytest, benchmarks, tt-smi, etc.). Other
+    agents may be using the device — the queue prevents conflicts.
 
-    This is the blocking version — it submits and waits in one call.
-    Use this when you have nothing else to do while waiting. If you want to
-    do other work while the command runs, use device_submit() instead and
-    call device_result() later.
+    Blocks until done. Use this when you have nothing else to do while waiting.
+    If you want to do other work while the command runs, use device_submit()
+    instead and call device_result() later.
 
     Args:
         cmd: Shell command to run (e.g. "pytest tests/" or "python train.py")
         cwd: Working directory for the command
         timeout: Max execution time in seconds (default 120)
-        agent: Tag identifying this agent (default "mcp-server")
+        agent: Tag identifying this agent
     """
     async with httpx.AsyncClient() as client:
         submit_result = await _post(client, "/queue", {
