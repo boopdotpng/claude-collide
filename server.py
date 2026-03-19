@@ -18,6 +18,7 @@ Endpoints:
 
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -58,6 +59,7 @@ class DeviceQueue:
     self._jobs: dict[str, Job] = {}          # all jobs by id
     self._pending_ids: list[str] = []        # ordered list of queued job ids
     self._current: Job | None = None
+    self._current_proc: subprocess.Popen | None = None
     self._history: list[dict] = []
     self._lock = threading.Lock()
 
@@ -120,6 +122,25 @@ class DeviceQueue:
         "recent": self._history[-10:],
       }
 
+  def kill_current(self) -> dict | None:
+    """Kill the currently running job. Returns info about the killed job, or None."""
+    with self._lock:
+      proc = self._current_proc
+      job = self._current
+      if not proc or not job:
+        return None
+      info = {"id": job.id, "cmd": job.cmd[:120], "agent": job.agent}
+
+    # Kill the entire process group
+    try:
+      os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+      try:
+        proc.kill()
+      except (ProcessLookupError, PermissionError):
+        pass
+    return info
+
   def worker_loop(self):
     """Runs forever in a dedicated thread. Processes jobs one at a time."""
     while True:
@@ -135,22 +156,30 @@ class DeviceQueue:
       print(f"[{job.id}] Running: {job.cmd[:100]}")
 
       try:
-        with open(job.output_file, "w") as out_f:
-          proc = subprocess.run(
-            job.cmd, shell=True,
-            stdout=out_f, stderr=subprocess.STDOUT,
-            cwd=job.cwd or None,
-            timeout=job.timeout,
-          )
+        out_f = open(job.output_file, "w")
+        proc = subprocess.Popen(
+          job.cmd, shell=True,
+          stdout=out_f, stderr=subprocess.STDOUT,
+          cwd=job.cwd or None,
+          start_new_session=True,  # own process group for clean kills
+        )
+        with self._lock:
+          self._current_proc = proc
+
+        try:
+          proc.wait(timeout=job.timeout)
           exit_code = proc.returncode
-      except subprocess.TimeoutExpired:
-        exit_code = -9
-        with open(job.output_file, "a") as out_f:
-          out_f.write(f"\n[tt-device-queue] Timed out after {job.timeout}s — killed\n")
+        except subprocess.TimeoutExpired:
+          os.killpg(proc.pid, signal.SIGKILL)
+          proc.wait()
+          exit_code = -9
+          out_f.write(f"\n[claude-collide] Timed out after {job.timeout}s — killed\n")
+        finally:
+          out_f.close()
       except Exception as e:
         exit_code = -1
-        with open(job.output_file, "a") as out_f:
-          out_f.write(f"\n[tt-device-queue] Error: {e}\n")
+        with open(job.output_file, "a") as f:
+          f.write(f"\n[claude-collide] Error: {e}\n")
 
       elapsed = round(time.time() - job.started_at, 2)
 
@@ -159,6 +188,7 @@ class DeviceQueue:
         job.exit_code = exit_code
         job.elapsed = elapsed
         self._current = None
+        self._current_proc = None
         self._history.append({
           "id": job.id, "cmd": job.cmd[:120], "agent": job.agent,
           "exit_code": exit_code, "elapsed": elapsed,
@@ -239,8 +269,26 @@ class Handler(BaseHTTPRequestHandler):
 
     self._json_response(404, {"error": "Not found"})
 
+  def _read_json_body(self) -> dict | None:
+    length = int(self.headers.get("Content-Length", 0))
+    if length == 0:
+      return {}
+    try:
+      return json.loads(self.rfile.read(length))
+    except json.JSONDecodeError:
+      self._json_response(400, {"error": "Invalid JSON"})
+      return None
+
   def do_POST(self):
     path = self.path.rstrip("/")
+
+    if path == "/kill":
+      killed = dq.kill_current()
+      if killed:
+        self._json_response(200, {"killed": killed})
+      else:
+        self._json_response(200, {"error": "Nothing running"})
+      return
 
     if path == "/queue":
       length = int(self.headers.get("Content-Length", 0))

@@ -28,7 +28,7 @@ from mcp.server.fastmcp import FastMCP
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 BASE = f"http://{HOST}:{PORT}"
-DEFAULT_TIMEOUT = 120
+DEFAULT_TIMEOUT = 60
 AGENT = os.environ.get("TT_AGENT", "mcp-server")
 
 # Poll interval when waiting for job completion — tight because it's localhost
@@ -254,6 +254,21 @@ async def device_status() -> str:
             lines.append(f"  [{r['id']}] {tag} {r.get('elapsed', '?')}s  {r['cmd']}")
 
     return "\n".join(lines)
+
+
+@server.tool()
+async def device_kill() -> str:
+    """Kill the currently running device job immediately. Use this when a
+    command is hung or you need to abort it. The job will be marked as failed
+    and the next queued job will start.
+    """
+    async with httpx.AsyncClient() as client:
+        result = await _post(client, "/kill", {})
+
+    killed = result.get("killed")
+    if killed:
+        return f"Killed job [{killed['id']}] {killed['cmd']} (agent={killed['agent']})"
+    return "Nothing running to kill."
 
 
 TT_SMI = os.path.expanduser("~/tenstorrent/.venv/bin/tt-smi")
