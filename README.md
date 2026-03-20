@@ -32,11 +32,13 @@ The MCP server enables an **async two-tool pattern**: the agent calls `device_su
 
 | Tool | Blocks? | Description |
 |---|---|---|
-| `device_submit(cmd, cwd, timeout)` | No | Enqueue a command, get back a `job_id` immediately |
+| `device_submit(cmd, cwd, timeout, repeat)` | No | Enqueue a command, get back a `job_id` immediately |
 | `device_result(job_id)` | Yes | Wait for a job to finish, return full output |
-| `device_run(cmd, cwd, timeout)` | Yes | Submit + wait in one call (convenience) |
+| `device_run(cmd, cwd, timeout, repeat)` | Yes | Submit + wait in one call (convenience) |
 | `device_status()` | No | Show running, queued, and recent jobs |
 | `device_reset()` | No | Queue a device reset command |
+
+`repeat` defaults to `1`. When set higher, the queue runs the same command sequentially inside a single queued job, appends all iterations into the same output file, and still returns one `job_id` for the agent to track. It stops immediately on the first failing iteration and returns the same failure signal/output shape as a normal run.
 
 ## Setup
 
@@ -107,6 +109,9 @@ Drop a `.mcp.json` in your project root:
 ```bash
 # Submit and block until done
 claude-collide exec my-command --flag arg
+
+# Submit and run it 10 times sequentially
+claude-collide --repeat 10 exec my-command --flag arg
 
 # Submit and get job_id back immediately
 claude-collide queue my-command --flag arg

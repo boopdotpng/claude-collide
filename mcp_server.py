@@ -20,6 +20,7 @@ Talks to the existing tt-device-queue HTTP server on localhost:5741.
 import asyncio
 import json
 import os
+import shlex
 from pathlib import Path
 
 import httpx
@@ -49,6 +50,30 @@ server = FastMCP(
 
 class DeviceQueueError(Exception):
     pass
+
+
+def _wrap_repeat_cmd(cmd: str, repeat: int) -> str:
+    if repeat < 1:
+        raise DeviceQueueError("repeat must be >= 1")
+    if repeat == 1:
+        return cmd
+
+    script = (
+        'i=1; '
+        'while [ "$i" -le "$1" ]; do '
+        'printf "\\n[claude-collide] Repeat %s/%s\\n" "$i" "$1"; '
+        'eval "$2" || exit $?; '
+        'i=$((i + 1)); '
+        'done'
+    )
+    return " ".join([
+        "/bin/sh",
+        "-c",
+        shlex.quote(script),
+        "sh",
+        shlex.quote(str(repeat)),
+        shlex.quote(cmd),
+    ])
 
 
 async def _post(client: httpx.AsyncClient, path: str, data: dict) -> dict:
@@ -113,6 +138,7 @@ async def device_submit(
     cmd: str,
     cwd: str = "",
     timeout: int = DEFAULT_TIMEOUT,
+    repeat: int = 1,
     agent: str = AGENT,
 ) -> str:
     """Submit a command to the device queue and return immediately with a job_id.
@@ -129,11 +155,15 @@ async def device_submit(
         cmd: Shell command to run (e.g. "pytest tests/" or "python train.py")
         cwd: Working directory for the command
         timeout: Max execution time in seconds (default 120)
+        repeat: Run the command this many times sequentially inside one queued job;
+            all output is appended to the same output file and execution stops on
+            the first failure
         agent: Tag identifying this agent
     """
+    queued_cmd = _wrap_repeat_cmd(cmd, repeat)
     async with httpx.AsyncClient() as client:
         result = await _post(client, "/queue", {
-            "cmd": cmd, "cwd": cwd, "timeout": timeout, "agent": agent,
+            "cmd": queued_cmd, "cwd": cwd, "timeout": timeout, "agent": agent,
         })
 
     return json.dumps({
@@ -141,7 +171,8 @@ async def device_submit(
         "output_file": result["output_file"],
         "position": result["position"],
         "estimated_wait_sec": result["estimated_wait_sec"],
-        "hint": "Call device_result(job_id) when you need the output. You can do other work in the meantime.",
+        "repeat": repeat,
+        "hint": "Call device_result(job_id) when you need the output. Repeat runs still use one job_id and append into one output file.",
     }, indent=2)
 
 
@@ -179,6 +210,7 @@ async def device_run(
     cmd: str,
     cwd: str = "",
     timeout: int = DEFAULT_TIMEOUT,
+    repeat: int = 1,
     agent: str = AGENT,
 ) -> str:
     """Submit a command to the device queue and wait for it to complete.
@@ -195,11 +227,15 @@ async def device_run(
         cmd: Shell command to run (e.g. "pytest tests/" or "python train.py")
         cwd: Working directory for the command
         timeout: Max execution time in seconds (default 120)
+        repeat: Run the command this many times sequentially inside one queued job;
+            all output is appended to the same output file and execution stops on
+            the first failure
         agent: Tag identifying this agent
     """
+    queued_cmd = _wrap_repeat_cmd(cmd, repeat)
     async with httpx.AsyncClient() as client:
         submit_result = await _post(client, "/queue", {
-            "cmd": cmd, "cwd": cwd, "timeout": timeout, "agent": agent,
+            "cmd": queued_cmd, "cwd": cwd, "timeout": timeout, "agent": agent,
         })
 
         job_id = submit_result["job_id"]
