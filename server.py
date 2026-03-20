@@ -31,12 +31,14 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from queue import Queue
 from dataclasses import dataclass, field
+from urllib.parse import parse_qs, urlparse
 
 HOST = os.environ.get("TT_DEVICE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 DEFAULT_TIMEOUT = int(os.environ.get("TT_DEVICE_TIMEOUT", "120"))
 LOG_DIR = Path(os.environ.get("TT_DEVICE_LOG_DIR", "/tmp/tt-device-logs"))
 ESTIMATE_PER_JOB = 10  # seconds assumed per queued job
+MAX_LOG_READ = 64 * 1024
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -187,6 +189,34 @@ class DeviceQueue:
 
       return data
 
+  def read_logs(self, job: Job, offset: int, limit: int) -> dict:
+    limit = max(1, min(limit, MAX_LOG_READ))
+    offset = max(0, offset)
+
+    try:
+      with open(job.output_file, "rb") as f:
+        f.seek(offset)
+        chunk = f.read(limit + 1)
+      file_size = os.path.getsize(job.output_file)
+    except FileNotFoundError:
+      chunk = b""
+      file_size = 0
+
+    truncated = len(chunk) > limit
+    data = chunk[:limit]
+    next_offset = offset + len(data)
+
+    return {
+      "job_id": job.id,
+      "status": job.status,
+      "output_file": job.output_file,
+      "offset": offset,
+      "next_offset": next_offset,
+      "content": data.decode("utf-8", errors="replace"),
+      "truncated": truncated,
+      "complete": job.status == "done" and next_offset >= file_size,
+    }
+
   def kill_current(self) -> dict | None:
     """Kill the currently running job. Returns info about the killed job, or None."""
     with self._lock:
@@ -323,7 +353,9 @@ class Handler(BaseHTTPRequestHandler):
     self.wfile.write(body)
 
   def do_GET(self):
-    path = self.path.rstrip("/")
+    parsed = urlparse(self.path)
+    path = parsed.path.rstrip("/")
+    query = parse_qs(parsed.query)
 
     if path == "/status":
       self._json_response(200, dq.status())
@@ -336,6 +368,23 @@ class Handler(BaseHTTPRequestHandler):
         self._json_response(404, {"error": f"Unknown job: {job_id}"})
         return
       self._json_response(200, dq.snapshot(job))
+      return
+
+    if path.startswith("/logs/"):
+      job_id = path[len("/logs/"):]
+      job = dq.get_job(job_id)
+      if not job:
+        self._json_response(404, {"error": f"Unknown job: {job_id}"})
+        return
+
+      try:
+        offset = int(query.get("offset", ["0"])[0])
+        limit = int(query.get("limit", [str(MAX_LOG_READ)])[0])
+      except ValueError:
+        self._json_response(400, {"error": "offset and limit must be integers"})
+        return
+
+      self._json_response(200, dq.read_logs(job, offset=offset, limit=limit))
       return
 
     if path.startswith("/result/"):

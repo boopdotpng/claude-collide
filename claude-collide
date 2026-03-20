@@ -4,6 +4,8 @@ claude-collide — submit commands to the tt-device-queue server.
 
 Usage:
   claude-collide queue <command...>                Submit a job, return immediately
+  claude-collide job <job_id>                      Show structured job status
+  claude-collide logs <job_id> [offset]           Read current job logs
   claude-collide result <job_id>                   Check if a job is done
   claude-collide exec <command...>                 Submit + block until done
   claude-collide status                            Show queue status
@@ -100,6 +102,27 @@ def cmd_result(job_id: str):
     print(f"status={data['status']}")
     print(f"position={data.get('position', '?')}")
     print(f"estimated_wait_sec={data.get('estimated_wait_sec', '?')}")
+
+
+def cmd_job(job_id: str):
+  data, code = http_get(f"/job/{job_id}")
+  if code == 404:
+    print(f"ERROR: {data.get('error', 'unknown job')}", file=sys.stderr)
+    sys.exit(1)
+  print(json.dumps(data, indent=2))
+
+
+def cmd_logs(job_id: str, offset: int = 0):
+  data, code = http_get(f"/logs/{job_id}?offset={offset}")
+  if code == 404:
+    print(f"ERROR: {data.get('error', 'unknown job')}", file=sys.stderr)
+    sys.exit(1)
+  if code != 200:
+    print(f"ERROR: {data.get('error', 'unknown')}", file=sys.stderr)
+    sys.exit(1)
+  sys.stdout.write(data.get("content", ""))
+  if data.get("truncated"):
+    print(f"\n[claude-collide] More logs available; next_offset={data.get('next_offset')}", file=sys.stderr)
 
 
 def cmd_exec(cmd: str, timeout: int, agent: str, cwd: str, repeat: int):
@@ -245,6 +268,19 @@ def main():
       print("Usage: claude-collide result <job_id>", file=sys.stderr)
       sys.exit(1)
     cmd_result(rest[0])
+
+  elif subcmd == "job":
+    if not rest:
+      print("Usage: claude-collide job <job_id>", file=sys.stderr)
+      sys.exit(1)
+    cmd_job(rest[0])
+
+  elif subcmd == "logs":
+    if not rest:
+      print("Usage: claude-collide logs <job_id> [offset]", file=sys.stderr)
+      sys.exit(1)
+    offset = int(rest[1]) if len(rest) > 1 else 0
+    cmd_logs(rest[0], offset)
 
   elif subcmd == "exec":
     if not rest:

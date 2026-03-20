@@ -10,6 +10,7 @@ it actually needs the output (blocks until done).
 Tools:
   device_submit  — Submit a command to the device queue. Returns immediately.
   device_job     — Get non-blocking structured status for a job.
+  device_logs    — Read the current output file for a job without blocking.
   device_result  — Wait for a job to finish and return its full output.
   device_run     — Submit + wait in one call (convenience, blocks until done).
   device_status  — Show what's running, queued, and recently completed.
@@ -163,6 +164,24 @@ async def device_job(job_id: str) -> str:
     """
     async with httpx.AsyncClient() as client:
         result = await _get(client, f"/job/{job_id}")
+
+    return json.dumps(result, indent=2)
+
+
+@server.tool()
+async def device_logs(job_id: str, offset: int = 0, limit: int = 16384) -> str:
+    """Read a chunk of the current output for a job without blocking.
+
+    This is useful for long-running jobs where you want live logs while polling
+    device_job(job_id) for structured status.
+
+    Args:
+        job_id: The job_id returned by device_submit()
+        offset: Byte offset to start reading from
+        limit: Maximum bytes to read in one call (capped server-side)
+    """
+    async with httpx.AsyncClient() as client:
+        result = await _get(client, f"/logs/{job_id}?offset={offset}&limit={limit}")
 
     return json.dumps(result, indent=2)
 

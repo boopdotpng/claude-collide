@@ -33,12 +33,14 @@ The MCP server enables an **async two-tool pattern**: the agent calls `device_su
 | Tool | Blocks? | Description |
 |---|---|---|
 | `device_submit(cmd, cwd, timeout, repeat)` | No | Enqueue a command, get back a `job_id` immediately |
+| `device_job(job_id)` | No | Fetch structured per-job status, timestamps, repeat progress, and queue position |
+| `device_logs(job_id, offset, limit)` | No | Read the current output file for a job without blocking |
 | `device_result(job_id)` | Yes | Wait for a job to finish, return full output |
 | `device_run(cmd, cwd, timeout, repeat)` | Yes | Submit + wait in one call (convenience) |
 | `device_status()` | No | Show running, queued, and recent jobs |
 | `device_reset()` | No | Queue a device reset command |
 
-`repeat` defaults to `1`. When set higher, the queue runs the same command sequentially inside a single queued job, appends all iterations into the same output file, and still returns one `job_id` for the agent to track. It stops immediately on the first failing iteration and returns the same failure signal/output shape as a normal run.
+`repeat` defaults to `1`. When set higher, the server runs the same command sequentially inside a single queued job, appends all iterations into the same output file, and still returns one `job_id` for the agent to track. It stops immediately on the first failing iteration and exposes repeat progress through `device_job` and `device_status`.
 
 ## Setup
 
@@ -115,6 +117,12 @@ claude-collide --repeat 10 exec my-command --flag arg
 
 # Submit and get job_id back immediately
 claude-collide queue my-command --flag arg
+
+# Inspect one job without blocking
+claude-collide job <job_id>
+
+# Stream the current output file in chunks
+claude-collide logs <job_id>
 
 # Check result
 claude-collide result <job_id>
