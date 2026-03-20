@@ -20,7 +20,6 @@ Talks to the existing tt-device-queue HTTP server on localhost:5741.
 import asyncio
 import json
 import os
-import shlex
 from pathlib import Path
 
 import httpx
@@ -50,30 +49,6 @@ server = FastMCP(
 
 class DeviceQueueError(Exception):
     pass
-
-
-def _wrap_repeat_cmd(cmd: str, repeat: int) -> str:
-    if repeat < 1:
-        raise DeviceQueueError("repeat must be >= 1")
-    if repeat == 1:
-        return cmd
-
-    script = (
-        'i=1; '
-        'while [ "$i" -le "$1" ]; do '
-        'printf "\\n[claude-collide] Repeat %s/%s\\n" "$i" "$1"; '
-        'eval "$2" || exit $?; '
-        'i=$((i + 1)); '
-        'done'
-    )
-    return " ".join([
-        "/bin/sh",
-        "-c",
-        shlex.quote(script),
-        "sh",
-        shlex.quote(str(repeat)),
-        shlex.quote(cmd),
-    ])
 
 
 async def _post(client: httpx.AsyncClient, path: str, data: dict) -> dict:
@@ -160,10 +135,9 @@ async def device_submit(
             the first failure
         agent: Tag identifying this agent
     """
-    queued_cmd = _wrap_repeat_cmd(cmd, repeat)
     async with httpx.AsyncClient() as client:
         result = await _post(client, "/queue", {
-            "cmd": queued_cmd, "cwd": cwd, "timeout": timeout, "agent": agent,
+            "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "agent": agent,
         })
 
     return json.dumps({
@@ -232,10 +206,9 @@ async def device_run(
             the first failure
         agent: Tag identifying this agent
     """
-    queued_cmd = _wrap_repeat_cmd(cmd, repeat)
     async with httpx.AsyncClient() as client:
         submit_result = await _post(client, "/queue", {
-            "cmd": queued_cmd, "cwd": cwd, "timeout": timeout, "agent": agent,
+            "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "agent": agent,
         })
 
         job_id = submit_result["job_id"]

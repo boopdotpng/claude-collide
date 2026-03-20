@@ -43,6 +43,7 @@ class Job:
   cmd: str
   cwd: str
   timeout: int
+  repeat: int
   agent: str
   submitted: float = field(default_factory=time.time)
   # Filled in by worker
@@ -51,6 +52,8 @@ class Job:
   elapsed: float | None = None
   output_file: str = ""
   started_at: float | None = None
+  repeat_current: int = 0
+  repeat_completed: int = 0
 
 
 class DeviceQueue:
@@ -63,15 +66,18 @@ class DeviceQueue:
     self._history: list[dict] = []
     self._lock = threading.Lock()
 
-  def submit(self, cmd: str, cwd: str, timeout: int, agent: str) -> tuple["Job", int, int]:
+  def submit(self, cmd: str, cwd: str, timeout: int, repeat: int, agent: str) -> tuple["Job", int, int]:
     """Submit a job. Returns (job, position, estimated_wait_sec) computed atomically."""
+    if repeat < 1:
+      raise ValueError("repeat must be >= 1")
+
     job_id = uuid.uuid4().hex[:8]
     output_dir = LOG_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = str(output_dir / "output")
 
     job = Job(
-      id=job_id, cmd=cmd, cwd=cwd, timeout=timeout,
+      id=job_id, cmd=cmd, cwd=cwd, timeout=timeout, repeat=repeat,
       agent=agent, output_file=output_file,
     )
 
@@ -156,26 +162,49 @@ class DeviceQueue:
       print(f"[{job.id}] Running: {job.cmd[:100]}")
 
       try:
-        out_f = open(job.output_file, "w")
-        proc = subprocess.Popen(
-          job.cmd, shell=True,
-          stdout=out_f, stderr=subprocess.STDOUT,
-          cwd=job.cwd or None,
-          start_new_session=True,  # own process group for clean kills
-        )
-        with self._lock:
-          self._current_proc = proc
+        deadline = job.started_at + job.timeout if job.timeout > 0 else None
+        exit_code = 0
+        with open(job.output_file, "w") as out_f:
+          for iteration in range(1, job.repeat + 1):
+            with self._lock:
+              job.repeat_current = iteration
 
-        try:
-          proc.wait(timeout=job.timeout)
-          exit_code = proc.returncode
-        except subprocess.TimeoutExpired:
-          os.killpg(proc.pid, signal.SIGKILL)
-          proc.wait()
-          exit_code = -9
-          out_f.write(f"\n[claude-collide] Timed out after {job.timeout}s — killed\n")
-        finally:
-          out_f.close()
+            if job.repeat > 1:
+              out_f.write(f"\n[claude-collide] Repeat {iteration}/{job.repeat}\n")
+              out_f.flush()
+
+            proc = subprocess.Popen(
+              job.cmd, shell=True,
+              stdout=out_f, stderr=subprocess.STDOUT,
+              cwd=job.cwd or None,
+              start_new_session=True,  # own process group for clean kills
+            )
+            with self._lock:
+              self._current_proc = proc
+
+            try:
+              wait_timeout = None if deadline is None else max(0, deadline - time.time())
+              if wait_timeout == 0:
+                raise subprocess.TimeoutExpired(job.cmd, job.timeout)
+              proc.wait(timeout=wait_timeout)
+              exit_code = proc.returncode
+            except subprocess.TimeoutExpired:
+              os.killpg(proc.pid, signal.SIGKILL)
+              proc.wait()
+              exit_code = -9
+              out_f.write(f"\n[claude-collide] Timed out after {job.timeout}s — killed\n")
+            finally:
+              out_f.flush()
+
+            if exit_code != 0:
+              break
+
+            with self._lock:
+              job.repeat_completed = iteration
+
+          if exit_code == 0:
+            with self._lock:
+              job.repeat_completed = job.repeat
       except Exception as e:
         exit_code = -1
         with open(job.output_file, "a") as f:
@@ -203,7 +232,8 @@ class DeviceQueue:
       with open(meta_path, "w") as f:
         json.dump({
           "id": job.id, "cmd": job.cmd, "cwd": job.cwd, "agent": job.agent,
-          "exit_code": exit_code, "elapsed": elapsed,
+          "exit_code": exit_code, "elapsed": elapsed, "repeat": job.repeat,
+          "repeat_completed": job.repeat_completed,
           "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(job.started_at)),
           "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
           "output_file": job.output_file,
@@ -310,6 +340,7 @@ class Handler(BaseHTTPRequestHandler):
         cmd=cmd,
         cwd=body.get("cwd", ""),
         timeout=body.get("timeout", DEFAULT_TIMEOUT),
+        repeat=body.get("repeat", 1),
         agent=body.get("agent", "unknown"),
       )
 
@@ -318,6 +349,7 @@ class Handler(BaseHTTPRequestHandler):
         "output_file": job.output_file,
         "position": jobs_ahead,
         "estimated_wait_sec": wait_sec,
+        "repeat": job.repeat,
       })
       return
 
