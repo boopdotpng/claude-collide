@@ -9,6 +9,7 @@ it actually needs the output (blocks until done).
 
 Tools:
   device_submit  — Submit a command to the device queue. Returns immediately.
+  device_job     — Get non-blocking structured status for a job.
   device_result  — Wait for a job to finish and return its full output.
   device_run     — Submit + wait in one call (convenience, blocks until done).
   device_status  — Show what's running, queued, and recently completed.
@@ -151,6 +152,22 @@ async def device_submit(
 
 
 @server.tool()
+async def device_job(job_id: str) -> str:
+    """Get structured status for a queued, running, or completed job.
+
+    This is non-blocking and is the preferred way to poll long-running jobs,
+    including repeated runs, without waiting for the final result.
+
+    Args:
+        job_id: The job_id returned by device_submit()
+    """
+    async with httpx.AsyncClient() as client:
+        result = await _get(client, f"/job/{job_id}")
+
+    return json.dumps(result, indent=2)
+
+
+@server.tool()
 async def device_result(job_id: str) -> str:
     """Wait for a previously submitted device job to finish and return its
     full output. Blocks until the job completes.
@@ -242,7 +259,12 @@ async def device_status() -> str:
     current = data.get("current")
     if current:
         lines.append(f"RUNNING: [{current['id']}] {current['cmd']}")
-        lines.append(f"         agent={current['agent']}  {current['running_sec']}s")
+        repeat = current.get("repeat", 1)
+        if repeat > 1:
+            progress = f"  repeat {current.get('repeat_current', 0)}/{repeat}"
+        else:
+            progress = ""
+        lines.append(f"         agent={current['agent']}  {current['running_sec']}s{progress}")
     else:
         lines.append("RUNNING: (idle)")
 
@@ -251,7 +273,8 @@ async def device_status() -> str:
         lines.append(f"\nQUEUED ({len(pending)}):")
         for p in pending:
             lines.append(f"  [{p['id']}] {p['cmd']}")
-            lines.append(f"           agent={p['agent']}  waiting {p['waiting_sec']}s")
+            repeat = f"  repeat {p['repeat']}x" if p.get('repeat', 1) > 1 else ""
+            lines.append(f"           agent={p['agent']}  waiting {p['waiting_sec']}s{repeat}")
     else:
         lines.append("\nQUEUED: (empty)")
 
@@ -260,7 +283,9 @@ async def device_status() -> str:
         lines.append(f"\nRECENT:")
         for r in recent:
             tag = "OK" if r.get("exit_code", 1) == 0 else f"FAIL({r.get('exit_code')})"
-            lines.append(f"  [{r['id']}] {tag} {r.get('elapsed', '?')}s  {r['cmd']}")
+            repeat = r.get("repeat", 1)
+            suffix = f"  repeat {r.get('repeat_completed', 0)}/{repeat}" if repeat > 1 else ""
+            lines.append(f"  [{r['id']}] {tag} {r.get('elapsed', '?')}s  {r['cmd']}{suffix}")
 
     return "\n".join(lines)
 

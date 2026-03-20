@@ -13,6 +13,10 @@ Endpoints:
                 -> {"status": "queued|running|done", "position", "estimated_wait_sec"}
                    or {"status": "done", "exit_code", "output_file", "elapsed"}
 
+  GET  /job/<job_id>
+                -> full job metadata including repeat progress, timestamps, and
+                   queue position when still pending
+
   GET  /status  -> {"current", "pending", "recent"}
 """
 
@@ -37,6 +41,12 @@ ESTIMATE_PER_JOB = 10  # seconds assumed per queued job
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _format_timestamp(ts: float | None) -> str | None:
+  if ts is None:
+    return None
+  return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
 @dataclass
 class Job:
   id: str
@@ -52,6 +62,7 @@ class Job:
   elapsed: float | None = None
   output_file: str = ""
   started_at: float | None = None
+  finished_at: float | None = None
   repeat_current: int = 0
   repeat_completed: int = 0
 
@@ -114,6 +125,9 @@ class DeviceQueue:
         current = {
           "id": j.id, "cmd": j.cmd[:120], "agent": j.agent,
           "running_sec": round(time.time() - (j.started_at or j.submitted), 1),
+          "repeat": j.repeat,
+          "repeat_current": j.repeat_current,
+          "repeat_completed": j.repeat_completed,
         }
       pending = []
       for jid in self._pending_ids:
@@ -121,12 +135,57 @@ class DeviceQueue:
         pending.append({
           "id": j.id, "cmd": j.cmd[:120], "agent": j.agent,
           "waiting_sec": round(time.time() - j.submitted, 1),
+          "repeat": j.repeat,
         })
       return {
         "current": current,
         "pending": pending,
         "recent": self._history[-10:],
       }
+
+  def snapshot(self, job: Job) -> dict:
+    with self._lock:
+      position = None
+      estimated_wait_sec = None
+      running_sec = None
+      if job.status == "queued":
+        try:
+          pos = self._pending_ids.index(job.id)
+        except ValueError:
+          pos = -1
+        position = pos + 1
+        estimated_wait_sec = (pos + 1) * ESTIMATE_PER_JOB
+      elif job.status == "running":
+        running_sec = round(time.time() - (job.started_at or job.submitted), 1)
+        position = 0
+        estimated_wait_sec = max(0, ESTIMATE_PER_JOB - running_sec)
+
+      data = {
+        "job_id": job.id,
+        "status": job.status,
+        "cmd": job.cmd,
+        "cwd": job.cwd,
+        "timeout": job.timeout,
+        "repeat": job.repeat,
+        "repeat_current": job.repeat_current,
+        "repeat_completed": job.repeat_completed,
+        "agent": job.agent,
+        "submitted_at": _format_timestamp(job.submitted),
+        "started_at": _format_timestamp(job.started_at),
+        "finished_at": _format_timestamp(job.finished_at),
+        "output_file": job.output_file,
+        "exit_code": job.exit_code,
+        "elapsed": job.elapsed,
+      }
+
+      if position is not None:
+        data["position"] = position
+      if estimated_wait_sec is not None:
+        data["estimated_wait_sec"] = estimated_wait_sec
+      if running_sec is not None:
+        data["running_sec"] = running_sec
+
+      return data
 
   def kill_current(self) -> dict | None:
     """Kill the currently running job. Returns info about the killed job, or None."""
@@ -216,6 +275,7 @@ class DeviceQueue:
         job.status = "done"
         job.exit_code = exit_code
         job.elapsed = elapsed
+        job.finished_at = time.time()
         self._current = None
         self._current_proc = None
         self._history.append({
@@ -223,6 +283,8 @@ class DeviceQueue:
           "exit_code": exit_code, "elapsed": elapsed,
           "finished": time.strftime("%H:%M:%S"),
           "output_file": job.output_file,
+          "repeat": job.repeat,
+          "repeat_completed": job.repeat_completed,
         })
         if len(self._history) > 50:
           self._history = self._history[-50:]
@@ -235,7 +297,7 @@ class DeviceQueue:
           "exit_code": exit_code, "elapsed": elapsed, "repeat": job.repeat,
           "repeat_completed": job.repeat_completed,
           "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(job.started_at)),
-          "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+          "finished": _format_timestamp(job.finished_at),
           "output_file": job.output_file,
         }, f, indent=2)
 
@@ -267,6 +329,15 @@ class Handler(BaseHTTPRequestHandler):
       self._json_response(200, dq.status())
       return
 
+    if path.startswith("/job/"):
+      job_id = path[len("/job/"):]
+      job = dq.get_job(job_id)
+      if not job:
+        self._json_response(404, {"error": f"Unknown job: {job_id}"})
+        return
+      self._json_response(200, dq.snapshot(job))
+      return
+
     if path.startswith("/result/"):
       job_id = path[len("/result/"):]
       job = dq.get_job(job_id)
@@ -280,6 +351,10 @@ class Handler(BaseHTTPRequestHandler):
           "exit_code": job.exit_code,
           "output_file": job.output_file,
           "elapsed": job.elapsed,
+          "repeat": job.repeat,
+          "repeat_completed": job.repeat_completed,
+          "started_at": _format_timestamp(job.started_at),
+          "finished_at": _format_timestamp(job.finished_at),
         })
       elif job.status == "running":
         running_for = round(time.time() - (job.started_at or job.submitted), 1)
@@ -287,6 +362,10 @@ class Handler(BaseHTTPRequestHandler):
           "status": "running",
           "position": 0,
           "estimated_wait_sec": max(0, ESTIMATE_PER_JOB - running_for),
+          "repeat": job.repeat,
+          "repeat_current": job.repeat_current,
+          "repeat_completed": job.repeat_completed,
+          "started_at": _format_timestamp(job.started_at),
         })
       else:
         pos = dq.position_of(job_id)
@@ -294,6 +373,10 @@ class Handler(BaseHTTPRequestHandler):
           "status": "queued",
           "position": pos + 1,  # 1-indexed for humans
           "estimated_wait_sec": (pos + 1) * ESTIMATE_PER_JOB,
+          "repeat": job.repeat,
+          "repeat_current": job.repeat_current,
+          "repeat_completed": job.repeat_completed,
+          "submitted_at": _format_timestamp(job.submitted),
         })
       return
 
