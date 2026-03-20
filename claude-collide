@@ -28,42 +28,27 @@ import json
 import os
 import sys
 import time
-import urllib.request
-import urllib.error
+
+from queue_client import QueueClientError, get, post
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 DEFAULT_TIMEOUT = 120
 BASE = f"http://{HOST}:{PORT}"
 
-
 def http_post(path, data):
-  body = json.dumps(data).encode()
-  req = urllib.request.Request(
-    f"{BASE}{path}", data=body,
-    headers={"Content-Type": "application/json"},
-    method="POST",
-  )
   try:
-    with urllib.request.urlopen(req, timeout=10) as resp:
-      return json.loads(resp.read()), resp.status
-  except urllib.error.HTTPError as e:
-    return json.loads(e.read()), e.code
-  except urllib.error.URLError:
-    print("ERROR: tt-device-queue server is not running.", file=sys.stderr)
-    print(f"Start it: python ~/tenstorrent/tt-device-queue/server.py &", file=sys.stderr)
+    return post(BASE, path, data)
+  except QueueClientError as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
     sys.exit(1)
 
 
 def http_get(path):
   try:
-    with urllib.request.urlopen(f"{BASE}{path}", timeout=10) as resp:
-      return json.loads(resp.read()), resp.status
-  except urllib.error.HTTPError as e:
-    return json.loads(e.read()), e.code
-  except urllib.error.URLError:
-    print("ERROR: tt-device-queue server is not running.", file=sys.stderr)
-    print(f"Start it: python ~/tenstorrent/tt-device-queue/server.py &", file=sys.stderr)
+    return get(BASE, path)
+  except QueueClientError as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -71,26 +56,21 @@ def cmd_queue(cmd: str, timeout: int, cwd: str, repeat: int):
   if repeat < 1:
     print("ERROR: --repeat must be >= 1", file=sys.stderr)
     sys.exit(1)
-  data, code = http_post("/queue", {
+  data = http_post("/queue", {
     "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
   })
-  if code != 200:
-    print(f"ERROR: {data.get('error', 'unknown')}", file=sys.stderr)
-    sys.exit(1)
 
   print(f"job_id={data['job_id']}")
   print(f"output_file={data['output_file']}")
   print(f"position={data['position']}")
   print(f"estimated_wait_sec={data['estimated_wait_sec']}")
+  if "estimated_run_sec" in data:
+    print(f"estimated_run_sec={data['estimated_run_sec']}")
   print(f"repeat={repeat}")
 
 
 def cmd_result(job_id: str):
-  data, code = http_get(f"/result/{job_id}")
-  if code == 404:
-    print(f"ERROR: {data.get('error', 'unknown job')}", file=sys.stderr)
-    sys.exit(1)
-
+  data = http_get(f"/result/{job_id}")
   if data["status"] == "done":
     print(f"status=done")
     print(f"exit_code={data['exit_code']}")
@@ -103,21 +83,12 @@ def cmd_result(job_id: str):
 
 
 def cmd_job(job_id: str):
-  data, code = http_get(f"/job/{job_id}")
-  if code == 404:
-    print(f"ERROR: {data.get('error', 'unknown job')}", file=sys.stderr)
-    sys.exit(1)
+  data = http_get(f"/job/{job_id}")
   print(json.dumps(data, indent=2))
 
 
 def cmd_logs(job_id: str, offset: int = 0):
-  data, code = http_get(f"/logs/{job_id}?offset={offset}")
-  if code == 404:
-    print(f"ERROR: {data.get('error', 'unknown job')}", file=sys.stderr)
-    sys.exit(1)
-  if code != 200:
-    print(f"ERROR: {data.get('error', 'unknown')}", file=sys.stderr)
-    sys.exit(1)
+  data = http_get(f"/logs/{job_id}?offset={offset}")
   sys.stdout.write(data.get("content", ""))
   if data.get("truncated"):
     print(f"\n[claude-collide] More logs available; next_offset={data.get('next_offset')}", file=sys.stderr)
@@ -128,12 +99,9 @@ def cmd_exec(cmd: str, timeout: int, cwd: str, repeat: int):
   if repeat < 1:
     print("ERROR: --repeat must be >= 1", file=sys.stderr)
     sys.exit(1)
-  data, code = http_post("/queue", {
+  data = http_post("/queue", {
     "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
   })
-  if code != 200:
-    print(f"ERROR: {data.get('error', 'unknown')}", file=sys.stderr)
-    sys.exit(1)
 
   job_id = data["job_id"]
   output_file = data["output_file"]
@@ -149,7 +117,7 @@ def cmd_exec(cmd: str, timeout: int, cwd: str, repeat: int):
     else:
       time.sleep(2)
 
-    result, _ = http_get(f"/result/{job_id}")
+    result = http_get(f"/result/{job_id}")
 
     if result["status"] == "done":
       print(f"exit_code={result['exit_code']}")
@@ -175,14 +143,18 @@ def cmd_exec(cmd: str, timeout: int, cwd: str, repeat: int):
 
 
 def cmd_status():
-  data, code = http_get("/status")
+  data = http_get("/status")
   current = data.get("current")
   pending = data.get("pending", [])
   recent = data.get("recent", [])
 
   if current:
     print(f"RUNNING: [{current['id']}] {current['cmd']}")
-    print(f"         {current['running_sec']}s")
+    repeat = current.get("repeat", 1)
+    progress = f"  repeat {current.get('repeat_current', 0)}/{repeat}" if repeat > 1 else ""
+    eta = current.get("estimated_remaining_sec")
+    eta_text = f"  eta ~{eta}s" if eta is not None else ""
+    print(f"         {current['running_sec']}s{progress}{eta_text}")
   else:
     print("RUNNING: (idle)")
 
@@ -190,7 +162,10 @@ def cmd_status():
     print(f"\nQUEUED ({len(pending)}):")
     for p in pending:
       print(f"  [{p['id']}] {p['cmd']}")
-      print(f"           waiting {p['waiting_sec']}s")
+      repeat = f"  repeat {p['repeat']}x" if p.get('repeat', 1) > 1 else ""
+      eta = p.get("estimated_wait_sec")
+      eta_text = f"  eta ~{eta}s" if eta is not None else ""
+      print(f"           waiting {p['waiting_sec']}s{repeat}{eta_text}")
   else:
     print("\nQUEUED: (empty)")
 
@@ -198,16 +173,15 @@ def cmd_status():
     print(f"\nRECENT:")
     for r in recent:
       tag = "OK" if r.get("exit_code", 1) == 0 else f"FAIL({r.get('exit_code')})"
-      print(f"  [{r['id']}] {tag} {r.get('elapsed', '?')}s  {r['cmd']}")
+      repeat = r.get("repeat", 1)
+      suffix = f"  repeat {r.get('repeat_completed', 0)}/{repeat}" if repeat > 1 else ""
+      print(f"  [{r['id']}] {tag} {r.get('elapsed', '?')}s  {r['cmd']}{suffix}")
 
 
 def cmd_reset():
-  data, code = http_post("/queue", {
+  data = http_post("/queue", {
     "cmd": "tt-smi -r", "cwd": "", "timeout": 30,
   })
-  if code != 200:
-    print(f"ERROR: {data.get('error', 'unknown')}", file=sys.stderr)
-    sys.exit(1)
   print(f"job_id={data['job_id']}")
   print(f"position={data['position']}")
   print(f"estimated_wait_sec={data['estimated_wait_sec']}")

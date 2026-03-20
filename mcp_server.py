@@ -25,8 +25,9 @@ import json
 import os
 from pathlib import Path
 
-import httpx
 from mcp.server.fastmcp import FastMCP
+
+from queue_client import QueueClientError, post, get, run_power_watch, wait_for_job
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
@@ -51,65 +52,16 @@ server = FastMCP(
 )
 
 
-class DeviceQueueError(Exception):
-    pass
+async def _wait_for_job(job_id: str) -> dict:
+    return await asyncio.to_thread(wait_for_job, BASE, job_id, POLL_INTERVAL)
 
 
-async def _post(client: httpx.AsyncClient, path: str, data: dict) -> dict:
-    try:
-        resp = await client.post(f"{BASE}{path}", json=data, timeout=10)
-        result = resp.json()
-        if resp.status_code != 200:
-            raise DeviceQueueError(result.get("error", f"HTTP {resp.status_code}"))
-        return result
-    except httpx.ConnectError:
-        raise DeviceQueueError(
-            "tt-device-queue server is not running. "
-            "Start it: python ~/tenstorrent/tt-device-queue/server.py &"
-        )
+async def _post(path: str, data: dict) -> dict:
+    return await asyncio.to_thread(post, BASE, path, data)
 
 
-async def _get(client: httpx.AsyncClient, path: str) -> dict:
-    try:
-        resp = await client.get(f"{BASE}{path}", timeout=10)
-        result = resp.json()
-        if resp.status_code == 404:
-            raise DeviceQueueError(result.get("error", "Not found"))
-        return result
-    except httpx.ConnectError:
-        raise DeviceQueueError(
-            "tt-device-queue server is not running. "
-            "Start it: python ~/tenstorrent/tt-device-queue/server.py &"
-        )
-
-
-async def _wait_for_job(client: httpx.AsyncClient, job_id: str) -> dict:
-    """Poll until the job is done. Returns the full result with output contents.
-
-    Uses fast initial polls (50ms) to catch instant failures, then backs off
-    to POLL_INTERVAL (500ms) for longer-running jobs.
-    """
-    interval = 0.05  # start fast for instant failures
-    while True:
-        result = await _get(client, f"/result/{job_id}")
-        if result["status"] == "done":
-            # Read the full output file
-            output_file = result.get("output_file", "")
-            output_text = ""
-            if output_file:
-                try:
-                    output_text = Path(output_file).read_text()
-                except (FileNotFoundError, PermissionError):
-                    output_text = f"(could not read {output_file})"
-
-            return {
-                "exit_code": result["exit_code"],
-                "elapsed": result["elapsed"],
-                "output_file": output_file,
-                "output": output_text,
-            }
-        await asyncio.sleep(interval)
-        interval = min(interval * 2, POLL_INTERVAL)  # backoff to 500ms
+async def _get(path: str) -> dict:
+    return await asyncio.to_thread(get, BASE, path)
 
 
 @server.tool()
@@ -137,10 +89,9 @@ async def device_submit(
             all output is appended to the same output file and execution stops on
             the first failure
     """
-    async with httpx.AsyncClient() as client:
-        result = await _post(client, "/queue", {
-            "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
-        })
+    result = await _post("/queue", {
+        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+    })
 
     return json.dumps({
         "job_id": result["job_id"],
@@ -163,8 +114,7 @@ async def device_job(job_id: str) -> str:
     Args:
         job_id: The job_id returned by device_submit()
     """
-    async with httpx.AsyncClient() as client:
-        result = await _get(client, f"/job/{job_id}")
+    result = await _get(f"/job/{job_id}")
 
     return json.dumps(result, indent=2)
 
@@ -181,8 +131,7 @@ async def device_logs(job_id: str, offset: int = 0, limit: int = 16384) -> str:
         offset: Byte offset to start reading from
         limit: Maximum bytes to read in one call (capped server-side)
     """
-    async with httpx.AsyncClient() as client:
-        result = await _get(client, f"/logs/{job_id}?offset={offset}&limit={limit}")
+    result = await _get(f"/logs/{job_id}?offset={offset}&limit={limit}")
 
     return json.dumps(result, indent=2)
 
@@ -194,21 +143,7 @@ async def device_power() -> str:
     This tool is safe to run concurrently and does not consume a queue slot.
     It returns average, minimum, and maximum total board power in watts.
     """
-    proc = await asyncio.create_subprocess_exec(
-        "uv", "run", str(POWER_WATCH),
-        cwd=str(REPO_ROOT),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    output = stdout.decode().strip()
-    error = stderr.decode().strip()
-
-    if proc.returncode != 0:
-        details = error or output or "power sampling failed"
-        raise DeviceQueueError(details)
-
-    return output
+    return await asyncio.to_thread(run_power_watch, REPO_ROOT, POWER_WATCH)
 
 
 @server.tool()
@@ -223,8 +158,7 @@ async def device_result(job_id: str) -> str:
     Args:
         job_id: The job_id returned by device_submit()
     """
-    async with httpx.AsyncClient() as client:
-        result = await _wait_for_job(client, job_id)
+    result = await _wait_for_job(job_id)
 
     exit_code = result["exit_code"]
     status = "OK" if exit_code == 0 else f"FAILED (exit code {exit_code})"
@@ -265,13 +199,12 @@ async def device_run(
             all output is appended to the same output file and execution stops on
             the first failure
     """
-    async with httpx.AsyncClient() as client:
-        submit_result = await _post(client, "/queue", {
-            "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
-        })
+    submit_result = await _post("/queue", {
+        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+    })
 
-        job_id = submit_result["job_id"]
-        result = await _wait_for_job(client, job_id)
+    job_id = submit_result["job_id"]
+    result = await _wait_for_job(job_id)
 
     exit_code = result["exit_code"]
     status = "OK" if exit_code == 0 else f"FAILED (exit code {exit_code})"
@@ -293,8 +226,7 @@ async def device_status() -> str:
     """Show what's currently running, queued, and recently completed on the device.
     Use this to check if the device is busy before submitting work, or to see
     the history of recent jobs."""
-    async with httpx.AsyncClient() as client:
-        data = await _get(client, "/status")
+    data = await _get("/status")
 
     lines = []
 
@@ -342,8 +274,7 @@ async def device_kill() -> str:
     command is hung or you need to abort it. The job will be marked as failed
     and the next queued job will start.
     """
-    async with httpx.AsyncClient() as client:
-        result = await _post(client, "/kill", {})
+    result = await _post("/kill", {})
 
     killed = result.get("killed")
     if killed:
@@ -366,12 +297,11 @@ async def device_reset(device: int = 0) -> str:
         device: Device number to reset (default 0)
     """
     cmd = f"{TT_SMI} -r {device}"
-    async with httpx.AsyncClient() as client:
-        submit_result = await _post(client, "/queue", {
-            "cmd": cmd, "cwd": "", "timeout": 30,
-        })
-        job_id = submit_result["job_id"]
-        result = await _wait_for_job(client, job_id)
+    submit_result = await _post("/queue", {
+        "cmd": cmd, "cwd": "", "timeout": 30,
+    })
+    job_id = submit_result["job_id"]
+    result = await _wait_for_job(job_id)
 
     exit_code = result["exit_code"]
     status = "OK" if exit_code == 0 else f"FAILED (exit code {exit_code})"
