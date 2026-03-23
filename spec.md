@@ -29,6 +29,7 @@ Each queued job has:
 - `cwd`: working directory passed to `subprocess.Popen`
 - `timeout`: total timeout budget for the whole job, not per repeat iteration
 - `repeat`: number of sequential executions inside the same job, minimum `1`
+- `mode`: `run` for normal jobs, `open` for intentionally long-running jobs
 - `status`: `queued`, `running`, or `done`
 - `output_file`: `/tmp/tt-device-logs/<job_id>/output` by default, overridable via `TT_DEVICE_LOG_DIR`
 - timestamps: `submitted_at`, `started_at`, `finished_at`
@@ -39,11 +40,14 @@ Each queued job has:
 
 - `repeat=1` behaves like a normal single command execution.
 - `repeat>1` executes the same command sequentially inside one queued job.
+- `mode=open` keeps the queue slot occupied until the process exits, times out, or is explicitly stopped.
+- `mode=open` requires `repeat=1`.
 - The queue creates exactly one `job_id` and one output file for the entire repeated run.
 - Before each repeated iteration, the server appends a marker line:
   - `[claude-collide] Repeat N/M`
 - If any iteration exits non-zero, the job stops immediately and later iterations are not run.
-- If the job times out, the currently running process group is killed and the job ends with exit code `-9`.
+- If the job times out, the server sends Ctrl+C to the process group first, waits briefly, then escalates to `SIGKILL` if needed. Timed-out jobs end with exit code `-9`.
+- Explicit stop requests use the same Ctrl+C-then-`SIGKILL` escalation path.
 - Timeout applies to the full repeated job, not to each iteration independently.
 
 ## Output and Metadata Files
@@ -75,7 +79,8 @@ Request JSON:
   "cmd": "python3 script.py",
   "cwd": "/path/to/repo",
   "timeout": 120,
-  "repeat": 1
+  "repeat": 1,
+  "mode": "run"
 }
 ```
 
@@ -83,6 +88,8 @@ Behavior:
 
 - `cmd` is required and must be non-empty after stripping.
 - `repeat` must be `>= 1`.
+- `mode` defaults to `run` and must be either `run` or `open`.
+- `mode=open` defaults to `180s` timeout when one is not provided.
 - Returns HTTP 200 with:
   - `job_id`
   - `output_file`
@@ -90,6 +97,8 @@ Behavior:
   - `estimated_wait_sec`
   - `estimated_run_sec`
   - `repeat`
+  - `mode`
+  - `timeout`
 
 ### GET `/result/<job_id>`
 
@@ -97,18 +106,21 @@ Returns one of:
 
 - queued:
   - `status=queued`
+  - `mode`
   - `position`
   - `estimated_wait_sec`
   - `estimated_remaining_sec`
   - repeat metadata
 - running:
   - `status=running`
+  - `mode`
   - `position=0`
   - `estimated_wait_sec=0`
   - `estimated_remaining_sec`
   - repeat metadata
 - done:
   - `status=done`
+  - `mode`
   - `exit_code`
   - `output_file`
   - `elapsed`
@@ -161,8 +173,11 @@ Returns global queue state:
 
 Behavior:
 
-- If a job is currently running, kills its process group immediately.
+- Accepts optional JSON body `{"job_id": "..."}`.
+- If the requested job is currently running, sends Ctrl+C to its process group.
+- The worker waits up to a short grace window, then escalates to `SIGKILL` if needed.
 - Returns `{"killed": {...}}` when something was killed.
+- Returns HTTP 409 when the requested job is not the currently running job.
 - Returns `{"error": "Nothing running"}` when idle.
 
 ## MCP Surface
@@ -170,13 +185,14 @@ Behavior:
 Implemented tools in `mcp_server.py`:
 
 - `device_submit(cmd, cwd, timeout, repeat)`
+- `open_forever(cmd, cwd, timeout)`
 - `device_job(job_id)`
 - `device_logs(job_id, offset, limit)`
 - `device_power()`
 - `device_result(job_id)`
 - `device_run(cmd, cwd, timeout, repeat)`
 - `device_status()`
-- `device_kill()`
+- `device_kill(job_id="")`
 - `device_reset(device=0)`
 
 MCP behavior notes:
@@ -192,12 +208,13 @@ MCP behavior notes:
 Implemented subcommands in `claude-collide`:
 
 - `queue <command...>`
+- `open <command...>`
 - `job <job_id>`
 - `logs <job_id> [offset] [limit]`
 - `power`
 - `result <job_id>`
 - `exec <command...>`
-- `kill`
+- `kill [job_id]`
 - `status`
 - `reset`
 

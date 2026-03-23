@@ -33,15 +33,19 @@ The MCP server enables an **async two-tool pattern**: the agent calls `device_su
 | Tool | Blocks? | Description |
 |---|---|---|
 | `device_submit(cmd, cwd, timeout, repeat)` | No | Enqueue a command, get back a `job_id` immediately |
+| `open_forever(cmd, cwd, timeout)` | No | Enqueue an intentionally long-running job that keeps the queue occupied until stopped |
 | `device_job(job_id)` | No | Fetch structured per-job status, timestamps, repeat progress, and queue position |
 | `device_logs(job_id, offset, limit)` | No | Read the current output file for a job without blocking |
 | `device_power()` | No | Sample board power for 3 seconds without consuming a queue slot |
 | `device_result(job_id)` | Yes | Wait for a job to finish, return full output |
 | `device_run(cmd, cwd, timeout, repeat)` | Yes | Submit + wait in one call (convenience) |
 | `device_status()` | No | Show running, queued, and recent jobs |
+| `device_kill(job_id="")` | No | Stop the running job, sending Ctrl+C first and force-killing only if needed |
 | `device_reset()` | No | Queue a device reset command |
 
 `repeat` defaults to `1`. When set higher, the server runs the same command sequentially inside a single queued job, appends all iterations into the same output file, and still returns one `job_id` for the agent to track. It stops immediately on the first failing iteration and exposes repeat progress through `device_job` and `device_status`. Initial ETA scales with `repeat`, then refines after the first successful iteration by reusing that iteration's runtime as the per-repeat estimate.
+
+`open_forever` is for commands that are intentionally meant to stay alive for a while, like local UI/profile servers. These jobs still use the same FIFO queue and stdout file, but they keep the queue slot occupied until they exit or the agent calls `device_kill(job_id)`. The server sends Ctrl+C first and only escalates to SIGKILL if the process ignores it. The default timeout for `open_forever` jobs is 180 seconds.
 
 ## Setup
 
@@ -119,6 +123,9 @@ claude-collide --repeat 10 exec my-command --flag arg
 # Submit and get job_id back immediately
 claude-collide queue my-command --flag arg
 
+# Submit an intentionally long-running command
+claude-collide open my-command --serve-ui --flag arg
+
 # Inspect one job without blocking
 claude-collide job <job_id>
 
@@ -131,8 +138,12 @@ claude-collide power
 # Check result
 claude-collide result <job_id>
 
-# Kill the currently running job
+
+# Stop the currently running job with Ctrl+C first
 claude-collide kill
+
+# Stop a specific running open job
+claude-collide kill <job_id>
 
 # View queue
 claude-collide status

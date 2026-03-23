@@ -4,17 +4,18 @@ claude-collide — submit commands to the tt-device-queue server.
 
 Usage:
   claude-collide queue <command...>                Submit a job, return immediately
+  claude-collide open <command...>                 Submit a long-running open job
   claude-collide job <job_id>                      Show structured job status
   claude-collide logs <job_id> [offset] [limit]   Read current job logs
   claude-collide power                             Sample board power directly
   claude-collide result <job_id>                   Check if a job is done
   claude-collide exec <command...>                 Submit + block until done
-  claude-collide kill                              Kill the running job
+  claude-collide kill [job_id]                     Stop a running job with Ctrl+C first
   claude-collide status                            Show queue status
   claude-collide reset                             Queue a device reset (tt-smi -r)
 
 Options (before subcommand):
-  --timeout N     Execution timeout in seconds (default: 120)
+  --timeout N     Execution timeout in seconds (default: 120, open: 180)
   --repeat N      Run the command N times sequentially (default: 1)
   --port PORT     Server port (default: 5741)
   --cwd DIR       Working directory for the command (default: current directory)
@@ -37,6 +38,7 @@ from queue_client import QueueClientError, get, post, run_power_watch
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 DEFAULT_TIMEOUT = 120
+DEFAULT_OPEN_TIMEOUT = 180
 BASE = f"http://{HOST}:{PORT}"
 REPO_ROOT = Path(__file__).resolve().parent
 POWER_WATCH = REPO_ROOT / "power_watch.py"
@@ -62,7 +64,7 @@ def cmd_queue(cmd: str, timeout: int, cwd: str, repeat: int):
     print("ERROR: --repeat must be >= 1", file=sys.stderr)
     sys.exit(1)
   data = http_post("/queue", {
-    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "mode": "run",
   })
 
   print(f"job_id={data['job_id']}")
@@ -74,6 +76,20 @@ def cmd_queue(cmd: str, timeout: int, cwd: str, repeat: int):
   print(f"repeat={repeat}")
 
 
+def cmd_open(cmd: str, timeout: int, cwd: str):
+  data = http_post("/queue", {
+    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": 1, "mode": "open",
+  })
+
+  print(f"job_id={data['job_id']}")
+  print(f"output_file={data['output_file']}")
+  print(f"position={data['position']}")
+  print(f"estimated_wait_sec={data['estimated_wait_sec']}")
+  print(f"estimated_run_sec={data['estimated_run_sec']}")
+  print(f"timeout={data['timeout']}")
+  print("mode=open")
+
+
 def cmd_result(job_id: str):
   data = http_get(f"/result/{job_id}")
   if data["status"] == "done":
@@ -81,6 +97,8 @@ def cmd_result(job_id: str):
     print(f"exit_code={data['exit_code']}")
     print(f"output_file={data['output_file']}")
     print(f"elapsed={data['elapsed']}")
+    if "mode" in data:
+      print(f"mode={data['mode']}")
   else:
     print(f"status={data['status']}")
     print(f"position={data.get('position', '?')}")
@@ -113,7 +131,7 @@ def cmd_exec(cmd: str, timeout: int, cwd: str, repeat: int):
     print("ERROR: --repeat must be >= 1", file=sys.stderr)
     sys.exit(1)
   data = http_post("/queue", {
-    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "mode": "run",
   })
 
   job_id = data["job_id"]
@@ -163,6 +181,8 @@ def cmd_status():
 
   if current:
     print(f"RUNNING: [{current['id']}] {current['cmd']}")
+    if current.get("mode") == "open":
+      print("         mode open")
     repeat = current.get("repeat", 1)
     progress = f"  repeat {current.get('repeat_current', 0)}/{repeat}" if repeat > 1 else ""
     eta = current.get("estimated_remaining_sec")
@@ -175,6 +195,8 @@ def cmd_status():
     print(f"\nQUEUED ({len(pending)}):")
     for p in pending:
       print(f"  [{p['id']}] {p['cmd']}")
+      if p.get("mode") == "open":
+        print("           mode open")
       repeat = f"  repeat {p['repeat']}x" if p.get('repeat', 1) > 1 else ""
       eta = p.get("estimated_wait_sec")
       eta_text = f"  eta ~{eta}s" if eta is not None else ""
@@ -195,7 +217,16 @@ def cmd_kill():
   data = http_post("/kill", {})
   killed = data.get("killed")
   if killed:
-    print(f"killed=[{killed['id']}] {killed['cmd']}")
+    print(f"killed=[{killed['id']}] {killed['cmd']} signal={killed.get('signal', 'SIGINT')}")
+  else:
+    print("nothing_running=true")
+
+
+def cmd_kill_job(job_id: str):
+  data = http_post("/kill", {"job_id": job_id})
+  killed = data.get("killed")
+  if killed:
+    print(f"killed=[{killed['id']}] {killed['cmd']} signal={killed.get('signal', 'SIGINT')}")
   else:
     print("nothing_running=true")
 
@@ -246,12 +277,20 @@ def main():
   rest = argv[1:]
 
   effective_cwd = cwd or os.getcwd()
+  if subcmd == "open" and timeout == DEFAULT_TIMEOUT:
+    timeout = DEFAULT_OPEN_TIMEOUT
 
   if subcmd == "queue":
     if not rest:
       print("Usage: claude-collide queue <command...>", file=sys.stderr)
       sys.exit(1)
     cmd_queue(" ".join(rest), timeout, effective_cwd, repeat)
+
+  elif subcmd == "open":
+    if not rest:
+      print("Usage: claude-collide open <command...>", file=sys.stderr)
+      sys.exit(1)
+    cmd_open(" ".join(rest), timeout, effective_cwd)
 
   elif subcmd == "result":
     if not rest:
@@ -286,7 +325,10 @@ def main():
     cmd_status()
 
   elif subcmd == "kill":
-    cmd_kill()
+    if rest:
+      cmd_kill_job(rest[0])
+    else:
+      cmd_kill()
 
   elif subcmd == "reset":
     cmd_reset()

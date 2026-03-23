@@ -9,12 +9,14 @@ it actually needs the output (blocks until done).
 
 Tools:
   device_submit  — Submit a command to the device queue. Returns immediately.
+  open_forever   — Submit an intentionally long-running command. Returns immediately.
   device_job     — Get non-blocking structured status for a job.
   device_logs    — Read the current output file for a job without blocking.
   device_power   — Sample board power directly without queueing.
   device_result  — Wait for a job to finish and return its full output.
   device_run     — Submit + wait in one call (convenience, blocks until done).
   device_status  — Show what's running, queued, and recently completed.
+  device_kill    — Gracefully stop a running job, then escalate if needed.
   device_reset   — Queue a device reset (tt-smi -r).
 
 Talks to the existing tt-device-queue HTTP server on localhost:5741.
@@ -33,6 +35,7 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 BASE = f"http://{HOST}:{PORT}"
 DEFAULT_TIMEOUT = 60
+DEFAULT_OPEN_TIMEOUT = 180
 REPO_ROOT = Path(__file__).resolve().parent
 POWER_WATCH = REPO_ROOT / "power_watch.py"
 
@@ -90,7 +93,7 @@ async def device_submit(
             the first failure
     """
     result = await _post("/queue", {
-        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "mode": "run",
     })
 
     return json.dumps({
@@ -101,6 +104,42 @@ async def device_submit(
         "estimated_run_sec": result.get("estimated_run_sec"),
         "repeat": repeat,
         "hint": "Call device_result(job_id) when you need the output. Repeat runs still use one job_id and append into one output file.",
+    }, indent=2)
+
+
+@server.tool(name="open_forever")
+async def open_forever(
+    cmd: str,
+    cwd: str = "",
+    timeout: int = DEFAULT_OPEN_TIMEOUT,
+) -> str:
+    """Start an intentionally long-running command that should stay open.
+
+    Use this for commands that launch a local web UI or keep streaming logs
+    for a while. The queue slot remains occupied until the
+    process exits or you call device_kill(job_id). Do NOT call device_result()
+    right away for these jobs; inspect them with device_job(job_id) and
+    device_logs(job_id, offset, limit) while they are alive.
+
+    Args:
+        cmd: Shell command to run and keep open
+        cwd: Working directory for the command
+        timeout: Max lifetime in seconds before the server force-kills it;
+            defaults to 180s and may be set higher when needed
+    """
+    result = await _post("/queue", {
+        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": 1, "mode": "open",
+    })
+
+    return json.dumps({
+        "job_id": result["job_id"],
+        "output_file": result["output_file"],
+        "position": result["position"],
+        "estimated_wait_sec": result["estimated_wait_sec"],
+        "estimated_run_sec": result.get("estimated_run_sec"),
+        "mode": result.get("mode", "open"),
+        "timeout": result.get("timeout", timeout),
+        "hint": "This job keeps the queue blocked while it runs. Use device_job/device_logs to monitor it, then call device_kill(job_id) when done.",
     }, indent=2)
 
 
@@ -200,7 +239,7 @@ async def device_run(
             the first failure
     """
     submit_result = await _post("/queue", {
-        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "mode": "run",
     })
 
     job_id = submit_result["job_id"]
@@ -233,6 +272,8 @@ async def device_status() -> str:
     current = data.get("current")
     if current:
         lines.append(f"RUNNING: [{current['id']}] {current['cmd']}")
+        if current.get("mode") == "open":
+            lines.append("         mode open")
         repeat = current.get("repeat", 1)
         if repeat > 1:
             progress = f"  repeat {current.get('repeat_current', 0)}/{repeat}"
@@ -249,6 +290,8 @@ async def device_status() -> str:
         lines.append(f"\nQUEUED ({len(pending)}):")
         for p in pending:
             lines.append(f"  [{p['id']}] {p['cmd']}")
+            if p.get("mode") == "open":
+                lines.append("           mode open")
             repeat = f"  repeat {p['repeat']}x" if p.get('repeat', 1) > 1 else ""
             eta = p.get("estimated_wait_sec")
             eta_text = f"  eta ~{eta}s" if eta is not None else ""
@@ -269,16 +312,24 @@ async def device_status() -> str:
 
 
 @server.tool()
-async def device_kill() -> str:
-    """Kill the currently running device job immediately. Use this when a
-    command is hung or you need to abort it. The job will be marked as failed
-    and the next queued job will start.
+async def device_kill(job_id: str = "") -> str:
+    """Stop a running device job, sending Ctrl+C first and escalating only if
+    it refuses to exit.
+
+    This is the normal way to stop open_forever jobs. If job_id is provided,
+    it must match the currently running job. If omitted, the current running
+    job is stopped.
+
+    Args:
+        job_id: Optional running job id to stop
     """
-    result = await _post("/kill", {})
+    payload = {"job_id": job_id} if job_id else {}
+    result = await _post("/kill", payload)
 
     killed = result.get("killed")
     if killed:
-        return f"Killed job [{killed['id']}] {killed['cmd']}"
+        signal_name = killed.get("signal", "SIGINT")
+        return f"Sent {signal_name} to job [{killed['id']}] {killed['cmd']}"
     return "Nothing running to kill."
 
 

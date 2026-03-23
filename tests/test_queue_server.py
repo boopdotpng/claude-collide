@@ -86,6 +86,15 @@ class QueueServerTest(unittest.TestCase):
       "repeat": repeat,
     })
 
+  def submit_open(self, cmd: str, timeout: int = 5) -> dict:
+    return self.post_json("/queue", {
+      "cmd": cmd,
+      "cwd": str(REPO_ROOT),
+      "timeout": timeout,
+      "repeat": 1,
+      "mode": "open",
+    })
+
   def wait_for_done(self, job_id: str, timeout: float = 10.0) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -94,6 +103,16 @@ class QueueServerTest(unittest.TestCase):
         return result
       time.sleep(0.05)
     raise AssertionError(f"job {job_id} did not finish in time")
+
+  def wait_for_logs(self, job_id: str, needle: str, timeout: float = 5.0) -> str:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+      logs = self.get_json(f"/logs/{job_id}?offset=0&limit=4096")
+      content = logs.get("content", "")
+      if needle in content:
+        return content
+      time.sleep(0.05)
+    raise AssertionError(f"log output for {job_id} did not contain {needle!r}")
 
   def python_cmd(self, code: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
@@ -155,6 +174,7 @@ class QueueServerTest(unittest.TestCase):
     self.assertIn("Repeat 1/3", logs["content"])
     self.assertNotIn("Repeat 2/3", logs["content"])
     self.assertIn("Timed out after 1s", logs["content"])
+    self.assertIn("Ctrl+C", logs["content"])
 
   def test_job_endpoint_reports_queue_running_and_done_metadata(self):
     first = self.submit("sleep 1", timeout=5)
@@ -255,6 +275,81 @@ class QueueServerTest(unittest.TestCase):
     result = self.wait_for_done(submit["job_id"])
     self.assertEqual(result["exit_code"], 0)
     self.assertEqual(result["repeat"], 1)
+
+  def test_open_job_blocks_queue_until_stopped(self):
+    code = (
+      "import signal, sys, time; "
+      "signal.signal(signal.SIGINT, lambda *_: (print('sigint', flush=True), sys.exit(0))); "
+      "print('ready', flush=True); "
+      "time.sleep(30)"
+    )
+    first = self.submit_open(self.python_cmd(code), timeout=10)
+
+    deadline = time.time() + 5
+    running_seen = False
+    while time.time() < deadline:
+      job = self.get_json(f"/job/{first['job_id']}")
+      if job["status"] == "running":
+        running_seen = True
+        self.assertEqual(job["mode"], "open")
+        break
+      time.sleep(0.05)
+    self.assertTrue(running_seen)
+    self.wait_for_logs(first["job_id"], "ready")
+
+    second = self.submit(self.python_cmd("print('after-open')"), timeout=5)
+    queued = self.get_json(f"/job/{second['job_id']}")
+    self.assertEqual(queued["status"], "queued")
+
+    stop = self.post_json("/kill", {"job_id": first["job_id"]})
+    self.assertEqual(stop["killed"]["id"], first["job_id"])
+
+    first_result = self.wait_for_done(first["job_id"])
+    self.assertEqual(first_result["exit_code"], 0)
+
+    second_result = self.wait_for_done(second["job_id"])
+    self.assertEqual(second_result["exit_code"], 0)
+
+    logs = self.get_json(f"/logs/{first['job_id']}?offset=0&limit=4096")
+    self.assertIn("Open job started", logs["content"])
+    self.assertIn("ready", logs["content"])
+    self.assertIn("sigint", logs["content"])
+
+  def test_open_job_that_ignores_sigint_is_force_killed(self):
+    code = (
+      "import signal, time; "
+      "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+      "print('running', flush=True); "
+      "time.sleep(30)"
+    )
+    submit = self.submit_open(self.python_cmd(code), timeout=20)
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+      job = self.get_json(f"/job/{submit['job_id']}")
+      if job["status"] == "running":
+        break
+      time.sleep(0.05)
+    self.wait_for_logs(submit["job_id"], "running")
+
+    self.post_json("/kill", {"job_id": submit["job_id"]})
+    result = self.wait_for_done(submit["job_id"], timeout=15)
+    self.assertEqual(result["exit_code"], -9)
+
+  def test_open_job_timeout_uses_sigint_then_kill_if_needed(self):
+    code = (
+      "import signal, time; "
+      "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+      "print('running', flush=True); "
+      "time.sleep(30)"
+    )
+    submit = self.submit_open(self.python_cmd(code), timeout=1)
+    result = self.wait_for_done(submit["job_id"], timeout=12)
+    self.assertEqual(result["exit_code"], -9)
+
+    logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
+    self.assertIn("Timed out after 1s", logs["content"])
+    self.assertIn("Ctrl+C", logs["content"])
 
 
 if __name__ == "__main__":
