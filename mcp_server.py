@@ -333,13 +333,14 @@ async def kill(job_id: str = "") -> str:
     return "Nothing running to kill."
 
 
-TT_SMI = os.path.expanduser("~/tenstorrent/.venv/bin/tt-smi")
+TT_SMI = os.path.expanduser("~/tenstorrent/blackhole-py/tt-smi.py")
 
 
 @server.tool(name="reset")
 async def reset(device: int = 0) -> str:
-    """Reset the Tenstorrent device via tt-smi. Queued through the FIFO like
-    any other command — waits for running jobs to finish first, then resets.
+    """Reset the Tenstorrent device via the blackhole-py tt-smi.py script
+    (does NOT require tt-kmd). Queued through the FIFO like any other
+    command — waits for running jobs to finish first, then resets.
 
     Use this when the device is in a bad state (hangs, errors, firmware
     issues, NaN outputs). Blocks until the reset completes.
