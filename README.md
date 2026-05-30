@@ -1,4 +1,4 @@
-# claude-collide
+# tt-device-queue
 
 FIFO job queue that serializes access to a shared resource (a GPU, a dev board, a serial port, etc.) so multiple AI agents — or humans — don't collide.
 
@@ -10,7 +10,7 @@ AI coding agents cannot use `flock` correctly. They forget the lock, release it 
 
 - **server.py** — HTTP server (localhost:5741) that runs a FIFO job queue. Commands execute one at a time via a single worker thread. Output is saved to `/tmp/tt-device-logs/<job_id>/output`.
 - **mcp_server.py** — MCP (Model Context Protocol) server that wraps the HTTP API as native tools for AI coding agents. Runs over stdio.
-- **claude-collide** — CLI client for submitting jobs and checking results from the shell.
+- **tt-device-queue** — CLI client for submitting jobs and checking results from the shell.
 
 ## Architecture
 
@@ -33,30 +33,32 @@ The MCP server enables an **async two-tool pattern**: the agent calls `submit` t
 
 | Tool | Blocks? | Description |
 |---|---|---|
-| `submit(cmd, cwd, timeout, repeat)` | No | Enqueue a command, get back a `job_id` immediately |
-| `open_forever(cmd, cwd, timeout)` | No | Enqueue an intentionally long-running job that keeps the queue occupied until stopped |
+| `submit(cmd, cwd, timeout, repeat, env)` | No | Enqueue a command, get back a `job_id` immediately |
+| `open_forever(cmd, cwd, timeout, env)` | No | Enqueue an intentionally long-running job that keeps the queue occupied until stopped |
 | `job(job_id)` | No | Fetch structured per-job status, timestamps, repeat progress, and queue position |
 | `logs(job_id, offset, limit)` | No | Read the current output file for a job without blocking |
 | `tt_smi_status()` | No | Print a one-shot `tt-smi --snapshot` telemetry view without consuming a queue slot |
 | `result(job_id)` | Yes | Wait for a job to finish, return full output |
-| `run(cmd, cwd, timeout, repeat)` | Yes | Submit + wait in one call (convenience) |
+| `run(cmd, cwd, timeout, repeat, env)` | Yes | Submit + wait in one call (convenience) |
 | `status()` | No | Show running, queued, and recent jobs |
 | `kill(job_id="")` | No | Stop the running job, sending Ctrl+C first and force-killing only if needed |
 | `reset()` | No | Queue a device reset command |
 
 `repeat` defaults to `1`. When set higher, the server runs the same command sequentially inside a single queued job, appends all iterations into the same output file, and still returns one `job_id` for the agent to track. It stops immediately on the first failing iteration and exposes repeat progress through `job` and `status`. Initial ETA scales with `repeat`, then refines after the first successful iteration by reusing that iteration's runtime as the per-repeat estimate.
 
+`env` defaults to `{}`. Values are merged into the server's job environment for the subprocess, so agents should pass `env={"TT_USB": "1"}` instead of putting `TT_USB=1` at the front of `cmd`.
+
 `open_forever` is for commands that are intentionally meant to stay alive for a while, like local UI/profile servers. These jobs still use the same FIFO queue and stdout file, but they keep the queue slot occupied until they exit or the agent calls `kill(job_id)`. Manual `kill` sends Ctrl+C first and only escalates to SIGKILL if the process ignores it; timeouts send SIGKILL immediately. The default timeout for `open_forever` jobs is 180 seconds.
 
 ## Setup
 
 ```bash
-git clone https://github.com/boopdotpng/claude-collide.git
-cd claude-collide
+git clone https://github.com/boopdotpng/tt-device-queue.git
+cd tt-device-queue
 ./install.sh
 ```
 
-The install script creates a venv, installs dependencies, symlinks `claude-collide` into `~/.local/bin`, and starts a systemd user service. At the end it prints the commands to register the MCP server with your agent.
+The install script creates a venv, installs dependencies, symlinks `tt-device-queue` into `~/.local/bin`, and starts a systemd user service. At the end it prints the commands to register the MCP server with your agent.
 
 ### Manual setup
 
@@ -69,27 +71,27 @@ uv pip install mcp
 python server.py &
 
 # Or install as a systemd service
-cp claude-collide.service ~/.config/systemd/user/
-systemctl --user enable --now claude-collide
+cp tt-device-queue.service ~/.config/systemd/user/
+systemctl --user enable --now tt-device-queue
 ```
 
 ## Registering the MCP server
 
 The MCP server command is:
 ```
-/path/to/claude-collide/.venv/bin/python3 /path/to/claude-collide/mcp_server.py
+/path/to/tt-device-queue/.venv/bin/python3 /path/to/tt-device-queue/mcp_server.py
 ```
 
 ### Claude Code
 
 ```bash
-claude mcp add -s user tt-device-queue -- /path/to/claude-collide/.venv/bin/python3 /path/to/claude-collide/mcp_server.py
+claude mcp add -s user tt-device-queue -- /path/to/tt-device-queue/.venv/bin/python3 /path/to/tt-device-queue/mcp_server.py
 ```
 
 ### Codex
 
 ```bash
-codex mcp add tt-device-queue -- /path/to/claude-collide/.venv/bin/python3 /path/to/claude-collide/mcp_server.py
+codex mcp add tt-device-queue -- /path/to/tt-device-queue/.venv/bin/python3 /path/to/tt-device-queue/mcp_server.py
 ```
 
 ### OpenCode
@@ -103,9 +105,9 @@ Drop a `.mcp.json` in your project root:
 {
   "mcpServers": {
     "tt-device-queue": {
-      "command": "/path/to/claude-collide/.venv/bin/python3",
+      "command": "/path/to/tt-device-queue/.venv/bin/python3",
       "args": ["mcp_server.py"],
-      "cwd": "/path/to/claude-collide",
+      "cwd": "/path/to/tt-device-queue",
       "timeout": 300
     }
   }
@@ -116,41 +118,44 @@ Drop a `.mcp.json` in your project root:
 
 ```bash
 # Submit and block until done
-claude-collide exec my-command --flag arg
+tt-device-queue exec my-command --flag arg
+
+# Add environment variables to the queued command
+tt-device-queue --env TT_USB=1 exec python3 examples/add1.py
 
 # Submit and run it 10 times sequentially
-claude-collide --repeat 10 exec my-command --flag arg
+tt-device-queue --repeat 10 exec my-command --flag arg
 
 # Submit and get job_id back immediately
-claude-collide queue my-command --flag arg
+tt-device-queue queue my-command --flag arg
 
 # Submit an intentionally long-running command
-claude-collide open my-command --serve-ui --flag arg
+tt-device-queue open my-command --serve-ui --flag arg
 
 # Inspect one job without blocking
-claude-collide job <job_id>
+tt-device-queue job <job_id>
 
 # Stream the current output file in chunks
-claude-collide logs <job_id> [offset] [limit]
+tt-device-queue logs <job_id> [offset] [limit]
 
 # Print a tt-smi telemetry snapshot directly without queueing
-claude-collide tt-smi-status
+tt-device-queue tt-smi-status
 
 # Check result
-claude-collide result <job_id>
+tt-device-queue result <job_id>
 
 
 # Stop the currently running job with Ctrl+C first
-claude-collide kill
+tt-device-queue kill
 
 # Stop a specific running open job
-claude-collide kill <job_id>
+tt-device-queue kill <job_id>
 
 # View queue
-claude-collide status
+tt-device-queue status
 
 # Queue a device reset
-claude-collide reset
+tt-device-queue reset
 ```
 
 ## License

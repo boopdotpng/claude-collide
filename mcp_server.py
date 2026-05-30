@@ -40,7 +40,7 @@ DEFAULT_OPEN_TIMEOUT = 180
 POLL_INTERVAL = 0.5
 
 server = FastMCP(
-    "claude-collide",
+    "tt-device-queue",
     instructions=(
         "FIFO queue for commands that touch the GPU/device. Other agents may be "
         "using the device concurrently — all device commands MUST go through these "
@@ -70,6 +70,7 @@ async def submit(
     cwd: str = "",
     timeout: int = DEFAULT_TIMEOUT,
     repeat: int = 1,
+    env: dict[str, str] | None = None,
 ) -> str:
     """Submit a command to the device queue and return immediately with a job_id.
 
@@ -88,9 +89,11 @@ async def submit(
         repeat: Run the command this many times sequentially inside one queued job;
             all output is appended to the same output file and execution stops on
             the first failure
+        env: Environment variables to add or override for the command.
     """
     result = await _post("/queue", {
-        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "mode": "run",
+        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+        "mode": "run", "env": env or {},
     })
 
     return json.dumps({
@@ -109,6 +112,7 @@ async def open_forever(
     cmd: str,
     cwd: str = "",
     timeout: int = DEFAULT_OPEN_TIMEOUT,
+    env: dict[str, str] | None = None,
 ) -> str:
     """Start an intentionally long-running command that should stay open.
 
@@ -123,9 +127,11 @@ async def open_forever(
         cwd: Working directory for the command
         timeout: Max lifetime in seconds before the server force-kills it;
             defaults to 180s and may be set higher when needed
+        env: Environment variables to add or override for the command.
     """
     result = await _post("/queue", {
-        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": 1, "mode": "open",
+        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": 1,
+        "mode": "open", "env": env or {},
     })
 
     return json.dumps({
@@ -216,6 +222,7 @@ async def run(
     cwd: str = "",
     timeout: int = DEFAULT_TIMEOUT,
     repeat: int = 1,
+    env: dict[str, str] | None = None,
 ) -> str:
     """Submit a command to the device queue and wait for it to complete.
 
@@ -234,9 +241,11 @@ async def run(
         repeat: Run the command this many times sequentially inside one queued job;
             all output is appended to the same output file and execution stops on
             the first failure
+        env: Environment variables to add or override for the command.
     """
     submit_result = await _post("/queue", {
-        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "mode": "run",
+        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+        "mode": "run", "env": env or {},
     })
 
     job_id = submit_result["job_id"]

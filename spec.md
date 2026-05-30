@@ -9,7 +9,7 @@ It is intended to be the source of truth for feature scope and runtime semantics
 - Provide three user-facing surfaces:
   - an HTTP queue server in `server.py`
   - an MCP wrapper in `mcp_server.py`
-  - a shell CLI in `claude-collide`
+  - a shell CLI in `tt-device-queue`
 - Provide one direct non-queued power telemetry path via `tt-smi.py --snapshot`.
 
 ## Process Model
@@ -29,6 +29,7 @@ Each queued job has:
 - `cwd`: working directory passed to `subprocess.Popen`
 - `timeout`: total timeout budget for the whole job, not per repeat iteration
 - `repeat`: number of sequential executions inside the same job, minimum `1`
+- `env`: per-job environment variables merged into the subprocess environment
 - `mode`: `run` for normal jobs, `open` for intentionally long-running jobs
 - `status`: `queued`, `running`, or `done`
 - `output_file`: `/tmp/tt-device-logs/<job_id>/output` by default, overridable via `TT_DEVICE_LOG_DIR`
@@ -44,7 +45,7 @@ Each queued job has:
 - `mode=open` requires `repeat=1`.
 - The queue creates exactly one `job_id` and one output file for the entire repeated run.
 - Before each repeated iteration, the server appends a marker line:
-  - `[claude-collide] Repeat N/M`
+  - `[tt-device-queue] Repeat N/M`
 - If any iteration exits non-zero, the job stops immediately and later iterations are not run.
 - If the job times out, the server sends `SIGKILL` to the process group immediately. Timed-out jobs end with exit code `-9`.
 - Explicit stop requests send Ctrl+C first, then escalate to `SIGKILL` if needed.
@@ -80,7 +81,8 @@ Request JSON:
   "cwd": "/path/to/repo",
   "timeout": 120,
   "repeat": 1,
-  "mode": "run"
+  "mode": "run",
+  "env": {"TT_USB": "1"}
 }
 ```
 
@@ -90,6 +92,7 @@ Behavior:
 - `repeat` must be `>= 1`.
 - `mode` defaults to `run` and must be either `run` or `open`.
 - `mode=open` defaults to `180s` timeout when one is not provided.
+- `env` defaults to `{}` and must be an object whose names and values are strings.
 - Returns HTTP 200 with:
   - `job_id`
   - `output_file`
@@ -184,13 +187,13 @@ Behavior:
 
 Implemented tools in `mcp_server.py`:
 
-- `submit(cmd, cwd, timeout, repeat)`
-- `open_forever(cmd, cwd, timeout)`
+- `submit(cmd, cwd, timeout, repeat, env)`
+- `open_forever(cmd, cwd, timeout, env)`
 - `job(job_id)`
 - `logs(job_id, offset, limit)`
 - `tt_smi_status()`
 - `result(job_id)`
-- `run(cmd, cwd, timeout, repeat)`
+- `run(cmd, cwd, timeout, repeat, env)`
 - `status()`
 - `kill(job_id="")`
 - `reset(device=0)`
@@ -205,7 +208,7 @@ MCP behavior notes:
 
 ## CLI Surface
 
-Implemented subcommands in `claude-collide`:
+Implemented subcommands in `tt-device-queue`:
 
 - `queue <command...>`
 - `open <command...>`
@@ -224,10 +227,12 @@ Global CLI options:
 - `--repeat N`
 - `--port PORT`
 - `--cwd DIR`
+- `--env KEY=VALUE`
 
 CLI behavior notes:
 
 - CLI queue/status behavior is intended to mirror the MCP-visible queue behavior.
+- `--env` may be repeated and is sent as the same per-job `env` object exposed by MCP.
 - CLI `tt-smi-status` runs the same direct tt-smi snapshot used by MCP.
 - CLI `kill` maps to HTTP `POST /kill`.
 
@@ -255,8 +260,8 @@ If no Blackhole PCIe device is found or telemetry fails, the command exits non-z
 ## Installation and Service Behavior
 
 - `install.sh` creates `.venv` and installs `mcp`.
-- `install.sh` symlinks `claude-collide` into `~/.local/bin`.
-- `install.sh` installs and enables the user systemd service from `claude-collide.service`.
+- `install.sh` symlinks `tt-device-queue` into `~/.local/bin`.
+- `install.sh` installs and enables the user systemd service from `tt-device-queue.service`.
 - The systemd unit starts only the HTTP queue server.
 - Updating `server.py` requires restarting the service.
 - Updating `mcp_server.py` requires reconnecting/restarting the MCP client session.

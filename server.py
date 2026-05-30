@@ -45,8 +45,10 @@ STOP_GRACE_SEC = 8
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _job_env() -> dict[str, str]:
+def _job_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
   env = os.environ.copy()
+  if extra_env:
+    env.update(extra_env)
   pythonpath = env.get("PYTHONPATH", "")
   parts = [part for part in pythonpath.split(os.pathsep) if part]
   if "." not in parts:
@@ -67,6 +69,7 @@ class Job:
   cwd: str
   timeout: int
   repeat: int
+  env: dict[str, str] = field(default_factory=dict)
   mode: str = "run"
   submitted: float = field(default_factory=time.time)
   # Filled in by worker
@@ -140,7 +143,15 @@ class DeviceQueue:
       pending_slice = self._pending_ids[:max(position, 0)]
       return self._estimate_wait_locked(pending_slice, include_current=True)
 
-  def submit(self, cmd: str, cwd: str, timeout: int, repeat: int, mode: str = "run") -> tuple["Job", int, int]:
+  def submit(
+      self,
+      cmd: str,
+      cwd: str,
+      timeout: int,
+      repeat: int,
+      mode: str = "run",
+      env: dict[str, str] | None = None,
+  ) -> tuple["Job", int, int]:
     """Submit a job. Returns (job, position, estimated_wait_sec) computed atomically."""
     if repeat < 1:
       raise ValueError("repeat must be >= 1")
@@ -148,6 +159,17 @@ class DeviceQueue:
       raise ValueError("mode must be 'run' or 'open'")
     if mode == "open" and repeat != 1:
       raise ValueError("open jobs do not support repeat")
+    if env is None:
+      env = {}
+    if not isinstance(env, dict):
+      raise ValueError("env must be an object mapping names to values")
+    for key, value in env.items():
+      if not isinstance(key, str) or not key:
+        raise ValueError("env names must be non-empty strings")
+      if "=" in key:
+        raise ValueError("env names must not contain '='")
+      if not isinstance(value, str):
+        raise ValueError("env values must be strings")
 
     job_id = uuid.uuid4().hex[:8]
     output_dir = LOG_DIR / job_id
@@ -156,7 +178,7 @@ class DeviceQueue:
 
     job = Job(
       id=job_id, cmd=cmd, cwd=cwd, timeout=timeout, repeat=repeat, mode=mode,
-      output_file=output_file,
+      env=dict(env), output_file=output_file,
     )
 
     with self._lock:
@@ -447,17 +469,17 @@ class DeviceQueue:
               job.current_iteration_started_at = time.time()
 
             if job.mode == "open":
-              out_f.write(f"[claude-collide] Open job started (timeout={job.timeout}s)\n")
+              out_f.write(f"[tt-device-queue] Open job started (timeout={job.timeout}s)\n")
               out_f.flush()
             elif job.repeat > 1:
-              out_f.write(f"\n[claude-collide] Repeat {iteration}/{job.repeat}\n")
+              out_f.write(f"\n[tt-device-queue] Repeat {iteration}/{job.repeat}\n")
               out_f.flush()
 
             proc = subprocess.Popen(
               f"exec {job.cmd}", shell=True, executable="/bin/bash",
               stdout=out_f, stderr=subprocess.STDOUT,
               cwd=job.cwd or None,
-              env=_job_env(),
+              env=_job_env(job.env),
               start_new_session=True,  # own process group for clean kills
             )
             with self._lock:
@@ -468,12 +490,12 @@ class DeviceQueue:
             except subprocess.TimeoutExpired:
               self._kill_for_timeout(proc)
               exit_code = -9
-              out_f.write(f"\n[claude-collide] Timed out after {job.timeout}s — sent SIGKILL\n")
+              out_f.write(f"\n[tt-device-queue] Timed out after {job.timeout}s — sent SIGKILL\n")
             finally:
               out_f.flush()
 
             if job.stop_requested_at is not None and exit_code == -2:
-              out_f.write("\n[claude-collide] Stopped with Ctrl+C\n")
+              out_f.write("\n[tt-device-queue] Stopped with Ctrl+C\n")
               out_f.flush()
 
             if exit_code != 0:
@@ -494,7 +516,7 @@ class DeviceQueue:
       except Exception as e:
         exit_code = -1
         with open(job.output_file, "a") as f:
-          f.write(f"\n[claude-collide] Error: {e}\n")
+          f.write(f"\n[tt-device-queue] Error: {e}\n")
 
       elapsed = round(time.time() - job.started_at, 2)
 
@@ -701,6 +723,7 @@ class Handler(BaseHTTPRequestHandler):
           timeout=timeout,
           repeat=body.get("repeat", 1),
           mode=mode,
+          env=body.get("env", {}),
         )
       except ValueError as exc:
         self._json_response(400, {"error": str(exc)})

@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$REPO_DIR/.venv"
 
-echo "=== claude-collide installer ==="
+echo "=== tt-device-queue installer ==="
 echo "Repo: $REPO_DIR"
 echo ""
 
@@ -19,19 +19,25 @@ else
   "$VENV/bin/pip" install mcp
 fi
 
-# 2. Symlink claude-collide to ~/.local/bin
-echo "[2/4] Adding claude-collide to PATH..."
+# 2. Symlink tt-device-queue to ~/.local/bin
+echo "[2/4] Adding tt-device-queue to PATH..."
 mkdir -p ~/.local/bin
-ln -sf "$REPO_DIR/claude-collide" ~/.local/bin/claude-collide
-echo "  -> ~/.local/bin/claude-collide"
+ln -sf "$REPO_DIR/tt-device-queue" ~/.local/bin/tt-device-queue
+echo "  -> ~/.local/bin/tt-device-queue"
+if [ -L ~/.local/bin/claude-collide ]; then
+  rm ~/.local/bin/claude-collide
+  echo "  -> removed legacy ~/.local/bin/claude-collide"
+fi
 
 # 3. Install and start systemd service
 echo "[3/4] Installing systemd service..."
 mkdir -p ~/.config/systemd/user
-cp "$REPO_DIR/claude-collide.service" ~/.config/systemd/user/
+cp "$REPO_DIR/tt-device-queue.service" ~/.config/systemd/user/
+systemctl --user disable --now claude-collide.service || true
+rm -f ~/.config/systemd/user/claude-collide.service
 systemctl --user daemon-reload
-systemctl --user enable --now claude-collide
-echo "  -> claude-collide.service enabled and started"
+systemctl --user enable --now tt-device-queue
+echo "  -> tt-device-queue.service enabled and started"
 
 # 4. Done — print MCP registration instructions
 echo "[4/4] Done!"

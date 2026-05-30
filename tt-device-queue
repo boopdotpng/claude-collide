@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
 """
-claude-collide — submit commands to the tt-device-queue server.
+tt-device-queue — submit commands to the tt-device-queue server.
 
 Usage:
-  claude-collide queue <command...>                Submit a job, return immediately
-  claude-collide open <command...>                 Submit a long-running open job
-  claude-collide job <job_id>                      Show structured job status
-  claude-collide logs <job_id> [offset] [limit]   Read current job logs
-  claude-collide tt-smi-status                     Print tt-smi telemetry directly
-  claude-collide result <job_id>                   Check if a job is done
-  claude-collide exec <command...>                 Submit + block until done
-  claude-collide kill [job_id]                     Stop a running job with Ctrl+C first
-  claude-collide status                            Show queue status
-  claude-collide reset                             Queue a device reset (tt-smi -r)
+  tt-device-queue queue <command...>                Submit a job, return immediately
+  tt-device-queue open <command...>                 Submit a long-running open job
+  tt-device-queue job <job_id>                      Show structured job status
+  tt-device-queue logs <job_id> [offset] [limit]   Read current job logs
+  tt-device-queue tt-smi-status                     Print tt-smi telemetry directly
+  tt-device-queue result <job_id>                   Check if a job is done
+  tt-device-queue exec <command...>                 Submit + block until done
+  tt-device-queue kill [job_id]                     Stop a running job with Ctrl+C first
+  tt-device-queue status                            Show queue status
+  tt-device-queue reset                             Queue a device reset (tt-smi -r)
 
 Options (before subcommand):
   --timeout N     Execution timeout in seconds (default: 120, open: 180)
   --repeat N      Run the command N times sequentially (default: 1)
   --port PORT     Server port (default: 5741)
   --cwd DIR       Working directory for the command (default: current directory)
+  --env KEY=VALUE Add or override an environment variable for the command
 
 Examples:
-  claude-collide --cwd ~/tenstorrent/blackhole-py queue PYTHONPATH=. uv run examples/matmul_peak.py
-  claude-collide result a1b2c3d4
-  claude-collide --cwd ~/tenstorrent/blackhole-py exec PYTHONPATH=. uv run examples/matmul_peak.py
-  claude-collide status
+  tt-device-queue --cwd ~/tenstorrent/blackhole-py --env PYTHONPATH=. queue uv run examples/matmul_peak.py
+  tt-device-queue result a1b2c3d4
+  tt-device-queue --cwd ~/tenstorrent/blackhole-py --env PYTHONPATH=. exec uv run examples/matmul_peak.py
+  tt-device-queue status
 """
 
 import json
@@ -56,12 +57,13 @@ def http_get(path):
     sys.exit(1)
 
 
-def cmd_queue(cmd: str, timeout: int, cwd: str, repeat: int):
+def cmd_queue(cmd: str, timeout: int, cwd: str, repeat: int, env: dict[str, str]):
   if repeat < 1:
     print("ERROR: --repeat must be >= 1", file=sys.stderr)
     sys.exit(1)
   data = http_post("/queue", {
-    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "mode": "run",
+    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+    "mode": "run", "env": env,
   })
 
   print(f"job_id={data['job_id']}")
@@ -73,9 +75,10 @@ def cmd_queue(cmd: str, timeout: int, cwd: str, repeat: int):
   print(f"repeat={repeat}")
 
 
-def cmd_open(cmd: str, timeout: int, cwd: str):
+def cmd_open(cmd: str, timeout: int, cwd: str, env: dict[str, str]):
   data = http_post("/queue", {
-    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": 1, "mode": "open",
+    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": 1,
+    "mode": "open", "env": env,
   })
 
   print(f"job_id={data['job_id']}")
@@ -111,7 +114,7 @@ def cmd_logs(job_id: str, offset: int = 0, limit: int = 16384):
   data = http_get(f"/logs/{job_id}?offset={offset}&limit={limit}")
   sys.stdout.write(data.get("content", ""))
   if data.get("truncated"):
-    print(f"\n[claude-collide] More logs available; next_offset={data.get('next_offset')}", file=sys.stderr)
+    print(f"\n[tt-device-queue] More logs available; next_offset={data.get('next_offset')}", file=sys.stderr)
 
 
 def cmd_tt_smi_status():
@@ -122,13 +125,14 @@ def cmd_tt_smi_status():
     sys.exit(1)
 
 
-def cmd_exec(cmd: str, timeout: int, cwd: str, repeat: int):
+def cmd_exec(cmd: str, timeout: int, cwd: str, repeat: int, env: dict[str, str]):
   """Submit, poll until done, print result."""
   if repeat < 1:
     print("ERROR: --repeat must be >= 1", file=sys.stderr)
     sys.exit(1)
   data = http_post("/queue", {
-    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat, "mode": "run",
+    "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+    "mode": "run", "env": env,
   })
 
   job_id = data["job_id"]
@@ -136,7 +140,7 @@ def cmd_exec(cmd: str, timeout: int, cwd: str, repeat: int):
   wait = data["estimated_wait_sec"]
 
   if wait > 0:
-    print(f"[claude-collide] Queued (position {data['position']}, ~{wait}s wait)", file=sys.stderr)
+    print(f"[tt-device-queue] Queued (position {data['position']}, ~{wait}s wait)", file=sys.stderr)
 
   # Poll until done
   while True:
@@ -167,7 +171,7 @@ def cmd_exec(cmd: str, timeout: int, cwd: str, repeat: int):
       sys.exit(0 if result["exit_code"] == 0 else 1)
     else:
       wait = result.get("estimated_wait_sec", 5)
-      print(f"[claude-collide] Still {result['status']} (position {result.get('position', '?')}, ~{wait}s)", file=sys.stderr)
+      print(f"[tt-device-queue] Still {result['status']} (position {result.get('position', '?')}, ~{wait}s)", file=sys.stderr)
 
 
 def cmd_status():
@@ -241,6 +245,7 @@ def main():
   argv = sys.argv[1:]
   timeout = DEFAULT_TIMEOUT
   repeat = 1
+  env = {}
 
   cwd = None
 
@@ -259,6 +264,13 @@ def main():
       argv = argv[2:]
     elif argv[0] == "--cwd" and len(argv) > 1:
       cwd = os.path.expanduser(argv[1])
+      argv = argv[2:]
+    elif argv[0] == "--env" and len(argv) > 1:
+      if "=" not in argv[1] or argv[1].startswith("="):
+        print("ERROR: --env must be KEY=VALUE", file=sys.stderr)
+        sys.exit(1)
+      key, value = argv[1].split("=", 1)
+      env[key] = value
       argv = argv[2:]
     elif argv[0] in ("--help", "-h"):
       print(__doc__.strip())
@@ -279,31 +291,31 @@ def main():
 
   if subcmd == "queue":
     if not rest:
-      print("Usage: claude-collide queue <command...>", file=sys.stderr)
+      print("Usage: tt-device-queue queue <command...>", file=sys.stderr)
       sys.exit(1)
-    cmd_queue(" ".join(rest), timeout, effective_cwd, repeat)
+    cmd_queue(" ".join(rest), timeout, effective_cwd, repeat, env)
 
   elif subcmd == "open":
     if not rest:
-      print("Usage: claude-collide open <command...>", file=sys.stderr)
+      print("Usage: tt-device-queue open <command...>", file=sys.stderr)
       sys.exit(1)
-    cmd_open(" ".join(rest), timeout, effective_cwd)
+    cmd_open(" ".join(rest), timeout, effective_cwd, env)
 
   elif subcmd == "result":
     if not rest:
-      print("Usage: claude-collide result <job_id>", file=sys.stderr)
+      print("Usage: tt-device-queue result <job_id>", file=sys.stderr)
       sys.exit(1)
     cmd_result(rest[0])
 
   elif subcmd == "job":
     if not rest:
-      print("Usage: claude-collide job <job_id>", file=sys.stderr)
+      print("Usage: tt-device-queue job <job_id>", file=sys.stderr)
       sys.exit(1)
     cmd_job(rest[0])
 
   elif subcmd == "logs":
     if not rest:
-      print("Usage: claude-collide logs <job_id> [offset] [limit]", file=sys.stderr)
+      print("Usage: tt-device-queue logs <job_id> [offset] [limit]", file=sys.stderr)
       sys.exit(1)
     offset = int(rest[1]) if len(rest) > 1 else 0
     limit = int(rest[2]) if len(rest) > 2 else 16384
@@ -314,9 +326,9 @@ def main():
 
   elif subcmd == "exec":
     if not rest:
-      print("Usage: claude-collide exec <command...>", file=sys.stderr)
+      print("Usage: tt-device-queue exec <command...>", file=sys.stderr)
       sys.exit(1)
-    cmd_exec(" ".join(rest), timeout, effective_cwd, repeat)
+    cmd_exec(" ".join(rest), timeout, effective_cwd, repeat, env)
 
   elif subcmd == "status":
     cmd_status()
