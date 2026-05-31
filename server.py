@@ -3,7 +3,7 @@
 tt-device-queue server — serializes access to the Tenstorrent device.
 
 HTTP API on localhost:5741. Jobs run one at a time (FIFO).
-Output is saved to /tmp/tt-device-logs/<job_id>/output.
+Output is saved to ./logs/<job_id>/output by default.
 
 Endpoints:
   POST /queue   {"cmd": "...", "cwd": "...", "timeout": 120, "repeat": 1}
@@ -22,7 +22,9 @@ Endpoints:
 
 import json
 import os
+import select
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
@@ -37,12 +39,15 @@ HOST = os.environ.get("TT_DEVICE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 DEFAULT_TIMEOUT = int(os.environ.get("TT_DEVICE_TIMEOUT", "120"))
 DEFAULT_OPEN_TIMEOUT = int(os.environ.get("TT_DEVICE_OPEN_TIMEOUT", "180"))
-LOG_DIR = Path(os.environ.get("TT_DEVICE_LOG_DIR", "/tmp/tt-device-logs"))
+REPO_ROOT = Path(__file__).resolve().parent
+LOG_DIR = Path(os.environ.get("TT_DEVICE_LOG_DIR", str(REPO_ROOT / "logs")))
+DB_PATH = LOG_DIR / "jobs.sqlite3"
 DEFAULT_ITER_ESTIMATE_SEC = 10
 MAX_LOG_READ = 64 * 1024
 STOP_GRACE_SEC = 8
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _job_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -86,16 +91,270 @@ class Job:
   per_iter_estimate_sec: float = DEFAULT_ITER_ESTIMATE_SEC
   stop_requested_at: float | None = None
   stop_escalated_at: float | None = None
+  log_size: int = 0
+
+
+class JobStore:
+  def __init__(self, db_path: Path):
+    self.db_path = db_path
+    self._init_schema()
+    self.mark_abandoned_jobs()
+
+  def _connect(self) -> sqlite3.Connection:
+    conn = sqlite3.connect(self.db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+  def _init_schema(self):
+    with self._connect() as conn:
+      conn.execute("PRAGMA journal_mode=WAL")
+      conn.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+          id TEXT PRIMARY KEY,
+          cmd TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          timeout INTEGER NOT NULL,
+          repeat INTEGER NOT NULL,
+          env_json TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          status TEXT NOT NULL,
+          submitted REAL NOT NULL,
+          started_at REAL,
+          finished_at REAL,
+          exit_code INTEGER,
+          elapsed REAL,
+          output_file TEXT NOT NULL,
+          repeat_current INTEGER NOT NULL,
+          repeat_completed INTEGER NOT NULL,
+          first_iteration_elapsed REAL,
+          per_iter_estimate_sec REAL NOT NULL,
+          stop_requested_at REAL,
+          stop_escalated_at REAL,
+          log_size INTEGER NOT NULL DEFAULT 0,
+          updated_at REAL NOT NULL
+        )
+      """)
+      conn.execute("""
+        CREATE TABLE IF NOT EXISTS log_chunks (
+          job_id TEXT NOT NULL,
+          offset INTEGER NOT NULL,
+          data BLOB NOT NULL,
+          created_at REAL NOT NULL,
+          PRIMARY KEY (job_id, offset),
+          FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )
+      """)
+      conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_finished_at ON jobs(finished_at DESC)"
+      )
+      conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_log_chunks_job_offset ON log_chunks(job_id, offset)"
+      )
+
+  def mark_abandoned_jobs(self):
+    now = time.time()
+    with self._connect() as conn:
+      rows = conn.execute(
+        "SELECT id, log_size FROM jobs WHERE status IN ('queued', 'running')"
+      ).fetchall()
+      for row in rows:
+        message = (
+          b"\n[tt-device-queue] Server restarted before this job completed\n"
+        )
+        offset = int(row["log_size"] or 0)
+        conn.execute(
+          """
+          INSERT OR IGNORE INTO log_chunks(job_id, offset, data, created_at)
+          VALUES (?, ?, ?, ?)
+          """,
+          (row["id"], offset, message, now),
+        )
+        conn.execute(
+          """
+          UPDATE jobs
+          SET status = 'done',
+              exit_code = -1,
+              finished_at = ?,
+              elapsed = CASE
+                WHEN started_at IS NULL THEN NULL
+                ELSE ROUND(? - started_at, 2)
+              END,
+              log_size = log_size + ?,
+              updated_at = ?
+          WHERE id = ?
+          """,
+          (now, now, len(message), now, row["id"]),
+        )
+
+  def save_job(self, job: Job):
+    with self._connect() as conn:
+      conn.execute(
+        """
+        INSERT INTO jobs (
+          id, cmd, cwd, timeout, repeat, env_json, mode, status, submitted,
+          started_at, finished_at, exit_code, elapsed, output_file,
+          repeat_current, repeat_completed, first_iteration_elapsed,
+          per_iter_estimate_sec, stop_requested_at, stop_escalated_at,
+          log_size, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          cmd = excluded.cmd,
+          cwd = excluded.cwd,
+          timeout = excluded.timeout,
+          repeat = excluded.repeat,
+          env_json = excluded.env_json,
+          mode = excluded.mode,
+          status = excluded.status,
+          submitted = excluded.submitted,
+          started_at = excluded.started_at,
+          finished_at = excluded.finished_at,
+          exit_code = excluded.exit_code,
+          elapsed = excluded.elapsed,
+          output_file = excluded.output_file,
+          repeat_current = excluded.repeat_current,
+          repeat_completed = excluded.repeat_completed,
+          first_iteration_elapsed = excluded.first_iteration_elapsed,
+          per_iter_estimate_sec = excluded.per_iter_estimate_sec,
+          stop_requested_at = excluded.stop_requested_at,
+          stop_escalated_at = excluded.stop_escalated_at,
+          log_size = excluded.log_size,
+          updated_at = excluded.updated_at
+        """,
+        (
+          job.id, job.cmd, job.cwd, job.timeout, job.repeat,
+          json.dumps(job.env, sort_keys=True), job.mode, job.status,
+          job.submitted, job.started_at, job.finished_at, job.exit_code,
+          job.elapsed, job.output_file, job.repeat_current, job.repeat_completed,
+          job.first_iteration_elapsed, job.per_iter_estimate_sec,
+          job.stop_requested_at, job.stop_escalated_at, job.log_size,
+          time.time(),
+        ),
+      )
+
+  def append_log(self, job_id: str, offset: int, data: bytes, log_size: int):
+    if not data:
+      return
+    with self._connect() as conn:
+      conn.execute(
+        """
+        INSERT OR IGNORE INTO log_chunks(job_id, offset, data, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (job_id, offset, data, time.time()),
+      )
+      conn.execute(
+        "UPDATE jobs SET log_size = ?, updated_at = ? WHERE id = ?",
+        (log_size, time.time(), job_id),
+      )
+
+  def load_job(self, job_id: str) -> Job | None:
+    with self._connect() as conn:
+      row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None:
+      return None
+    return self._row_to_job(row)
+
+  def recent_completed(self, limit: int = 10) -> list[dict]:
+    with self._connect() as conn:
+      rows = conn.execute(
+        """
+        SELECT * FROM jobs
+        WHERE status = 'done'
+        ORDER BY finished_at DESC, submitted DESC
+        LIMIT ?
+        """,
+        (limit,),
+      ).fetchall()
+    return [self._history_row(row) for row in reversed(rows)]
+
+  def read_logs(self, job_id: str, offset: int, limit: int) -> tuple[bytes, int, bool]:
+    with self._connect() as conn:
+      row = conn.execute(
+        "SELECT log_size FROM jobs WHERE id = ?",
+        (job_id,),
+      ).fetchone()
+      if row is None:
+        return b"", 0, False
+      file_size = int(row["log_size"] or 0)
+      chunks = conn.execute(
+        """
+        SELECT offset, data FROM log_chunks
+        WHERE job_id = ? AND offset + length(data) > ?
+        ORDER BY offset
+        """,
+        (job_id, offset),
+      ).fetchall()
+
+    data = bytearray()
+    for chunk in chunks:
+      chunk_offset = int(chunk["offset"])
+      chunk_data = bytes(chunk["data"])
+      start = max(0, offset - chunk_offset)
+      if start >= len(chunk_data):
+        continue
+      data.extend(chunk_data[start:])
+      if len(data) > limit:
+        break
+
+    truncated = len(data) > limit
+    return bytes(data[:limit]), file_size, truncated
+
+  def _row_to_job(self, row: sqlite3.Row) -> Job:
+    try:
+      env = json.loads(row["env_json"] or "{}")
+    except json.JSONDecodeError:
+      env = {}
+    return Job(
+      id=row["id"],
+      cmd=row["cmd"],
+      cwd=row["cwd"],
+      timeout=int(row["timeout"]),
+      repeat=int(row["repeat"]),
+      env=env,
+      mode=row["mode"],
+      submitted=float(row["submitted"]),
+      status=row["status"],
+      exit_code=row["exit_code"],
+      elapsed=row["elapsed"],
+      output_file=row["output_file"],
+      started_at=row["started_at"],
+      finished_at=row["finished_at"],
+      repeat_current=int(row["repeat_current"]),
+      repeat_completed=int(row["repeat_completed"]),
+      first_iteration_elapsed=row["first_iteration_elapsed"],
+      per_iter_estimate_sec=float(row["per_iter_estimate_sec"]),
+      stop_requested_at=row["stop_requested_at"],
+      stop_escalated_at=row["stop_escalated_at"],
+      log_size=int(row["log_size"] or 0),
+    )
+
+  def _history_row(self, row: sqlite3.Row) -> dict:
+    return {
+      "id": row["id"],
+      "cmd": row["cmd"][:120],
+      "exit_code": row["exit_code"],
+      "elapsed": row["elapsed"],
+      "finished": (
+        time.strftime("%H:%M:%S", time.localtime(row["finished_at"]))
+        if row["finished_at"] else None
+      ),
+      "output_file": row["output_file"],
+      "repeat": row["repeat"],
+      "mode": row["mode"],
+      "repeat_completed": row["repeat_completed"],
+      "per_iter_estimate_sec": round(row["per_iter_estimate_sec"], 2),
+    }
 
 
 class DeviceQueue:
-  def __init__(self):
+  def __init__(self, store: JobStore):
+    self._store = store
     self._queue: Queue[Job] = Queue()
     self._jobs: dict[str, Job] = {}          # all jobs by id
     self._pending_ids: list[str] = []        # ordered list of queued job ids
     self._current: Job | None = None
     self._current_proc: subprocess.Popen | None = None
-    self._history: list[dict] = []
     self._lock = threading.Lock()
 
   def _estimated_remaining_locked(self, job: Job, now: float | None = None) -> int:
@@ -189,11 +448,19 @@ class DeviceQueue:
       jobs_ahead = pos + (1 if self._current else 0)
       wait_sec = self._estimate_wait_locked(self._pending_ids[:pos], include_current=True)
 
+    self._store.save_job(job)
     self._queue.put(job)
     return job, jobs_ahead, wait_sec
 
   def get_job(self, job_id: str) -> Job | None:
-    return self._jobs.get(job_id)
+    job = self._jobs.get(job_id)
+    if job is not None:
+      return job
+    stored = self._store.load_job(job_id)
+    if stored is not None and stored.status == "done":
+      self._jobs[job_id] = stored
+      return stored
+    return None
 
   def position_of(self, job_id: str) -> int:
     """0-indexed position in the pending queue. -1 if not pending."""
@@ -235,7 +502,7 @@ class DeviceQueue:
       return {
         "current": current,
         "pending": pending,
-        "recent": self._history[-10:],
+        "recent": self._store.recent_completed(10),
       }
 
   def snapshot(self, job: Job) -> dict:
@@ -297,17 +564,22 @@ class DeviceQueue:
     limit = max(1, min(limit, MAX_LOG_READ))
     offset = max(0, offset)
 
-    try:
-      with open(job.output_file, "rb") as f:
-        f.seek(offset)
-        chunk = f.read(limit + 1)
-      file_size = os.path.getsize(job.output_file)
-    except FileNotFoundError:
-      chunk = b""
-      file_size = 0
-
-    truncated = len(chunk) > limit
-    data = chunk[:limit]
+    data, file_size, truncated = self._store.read_logs(job.id, offset, limit + 1)
+    if file_size == 0 and not data:
+      try:
+        with open(job.output_file, "rb") as f:
+          f.seek(offset)
+          chunk = f.read(limit + 1)
+        file_size = os.path.getsize(job.output_file)
+        truncated = len(chunk) > limit
+        data = chunk[:limit]
+      except FileNotFoundError:
+        data = b""
+        file_size = 0
+        truncated = False
+    else:
+      truncated = len(data) > limit
+      data = data[:limit]
     next_offset = offset + len(data)
 
     return {
@@ -333,6 +605,7 @@ class DeviceQueue:
       now = time.time()
       if job.stop_requested_at is None:
         job.stop_requested_at = now
+        self._store.save_job(job)
       info = {"id": job.id, "cmd": job.cmd[:120], "signal": "SIGINT"}
 
     # Send Ctrl+C-equivalent to the whole process group first.
@@ -400,7 +673,44 @@ class DeviceQueue:
     self._send_sigkill(proc)
     proc.wait()
 
-  def _wait_for_process(self, job: Job, proc: subprocess.Popen, deadline: float | None) -> int:
+  def _append_output(self, job: Job, out_f, data: bytes):
+    if not data:
+      return
+    out_f.write(data)
+    out_f.flush()
+    with self._lock:
+      offset = job.log_size
+      job.log_size += len(data)
+      log_size = job.log_size
+    self._store.append_log(job.id, offset, data, log_size)
+
+  def _drain_process_output(self, job: Job, proc: subprocess.Popen, out_f):
+    if proc.stdout is None:
+      return
+    fd = proc.stdout.fileno()
+    while True:
+      try:
+        data = os.read(fd, 64 * 1024)
+      except BlockingIOError:
+        return
+      if not data:
+        return
+      self._append_output(job, out_f, data)
+
+  def _read_ready_process_output(self, job: Job, proc: subprocess.Popen, out_f, timeout: float):
+    if proc.stdout is None:
+      time.sleep(timeout)
+      return
+    fd = proc.stdout.fileno()
+    readable, _, _ = select.select([fd], [], [], timeout)
+    if not readable:
+      return
+    self._drain_process_output(job, proc, out_f)
+
+  def _wait_for_process(self, job: Job, proc: subprocess.Popen, out_f, deadline: float | None) -> int:
+    if proc.stdout is not None:
+      os.set_blocking(proc.stdout.fileno(), False)
+
     while True:
       timeout_remaining = None
       if deadline is not None:
@@ -412,13 +722,11 @@ class DeviceQueue:
       if timeout_remaining is not None:
         poll_window = min(poll_window, max(0.01, timeout_remaining))
 
-      try:
-        proc.wait(timeout=poll_window)
-      except subprocess.TimeoutExpired:
-        pass
+      self._read_ready_process_output(job, proc, out_f, poll_window)
 
       ret = proc.poll()
       if ret is not None:
+        self._drain_process_output(job, proc, out_f)
         with self._lock:
           stop_requested_at = job.stop_requested_at
           stop_escalated_at = job.stop_escalated_at
@@ -427,6 +735,7 @@ class DeviceQueue:
             with self._lock:
               if job.stop_escalated_at is None:
                 job.stop_escalated_at = time.time()
+                self._store.save_job(job)
             self._send_sigkill(proc)
           time.sleep(0.1)
           continue
@@ -439,6 +748,7 @@ class DeviceQueue:
         if job.stop_requested_at is not None and job.stop_escalated_at is None:
           if time.time() - job.stop_requested_at >= STOP_GRACE_SEC:
             job.stop_escalated_at = time.time()
+            self._store.save_job(job)
             should_kill = True
 
       if should_kill:
@@ -455,48 +765,62 @@ class DeviceQueue:
         self._current = job
         if job.id in self._pending_ids:
           self._pending_ids.remove(job.id)
+        self._store.save_job(job)
 
       print(f"[{job.id}] Running: {job.cmd[:100]}")
 
       try:
         deadline = job.started_at + job.timeout if job.timeout > 0 else None
         exit_code = 0
-        with open(job.output_file, "w") as out_f:
+        with open(job.output_file, "wb") as out_f:
           iterations = range(1, job.repeat + 1) if job.mode == "run" else range(1, 2)
           for iteration in iterations:
             with self._lock:
               job.repeat_current = iteration
               job.current_iteration_started_at = time.time()
+              self._store.save_job(job)
 
             if job.mode == "open":
-              out_f.write(f"[tt-device-queue] Open job started (timeout={job.timeout}s)\n")
-              out_f.flush()
+              self._append_output(
+                job,
+                out_f,
+                f"[tt-device-queue] Open job started (timeout={job.timeout}s)\n".encode(),
+              )
             elif job.repeat > 1:
-              out_f.write(f"\n[tt-device-queue] Repeat {iteration}/{job.repeat}\n")
-              out_f.flush()
+              self._append_output(
+                job,
+                out_f,
+                f"\n[tt-device-queue] Repeat {iteration}/{job.repeat}\n".encode(),
+              )
 
             proc = subprocess.Popen(
               f"exec {job.cmd}", shell=True, executable="/bin/bash",
-              stdout=out_f, stderr=subprocess.STDOUT,
+              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
               cwd=job.cwd or None,
               env=_job_env(job.env),
               start_new_session=True,  # own process group for clean kills
             )
             with self._lock:
               self._current_proc = proc
+              self._store.save_job(job)
 
             try:
-              exit_code = self._wait_for_process(job, proc, deadline)
+              exit_code = self._wait_for_process(job, proc, out_f, deadline)
             except subprocess.TimeoutExpired:
               self._kill_for_timeout(proc)
+              self._drain_process_output(job, proc, out_f)
               exit_code = -9
-              out_f.write(f"\n[tt-device-queue] Timed out after {job.timeout}s — sent SIGKILL\n")
+              self._append_output(
+                job,
+                out_f,
+                f"\n[tt-device-queue] Timed out after {job.timeout}s — sent SIGKILL\n".encode(),
+              )
             finally:
-              out_f.flush()
+              if proc.stdout is not None:
+                proc.stdout.close()
 
             if job.stop_requested_at is not None and exit_code == -2:
-              out_f.write("\n[tt-device-queue] Stopped with Ctrl+C\n")
-              out_f.flush()
+              self._append_output(job, out_f, b"\n[tt-device-queue] Stopped with Ctrl+C\n")
 
             if exit_code != 0:
               break
@@ -508,15 +832,17 @@ class DeviceQueue:
                 job.first_iteration_elapsed = round(iteration_elapsed, 2)
                 job.per_iter_estimate_sec = max(0.1, iteration_elapsed)
               job.current_iteration_started_at = None
+              self._store.save_job(job)
 
           if exit_code == 0:
             with self._lock:
               job.repeat_completed = job.repeat
               job.current_iteration_started_at = None
+              self._store.save_job(job)
       except Exception as e:
         exit_code = -1
-        with open(job.output_file, "a") as f:
-          f.write(f"\n[tt-device-queue] Error: {e}\n")
+        with open(job.output_file, "ab") as f:
+          self._append_output(job, f, f"\n[tt-device-queue] Error: {e}\n".encode())
 
       elapsed = round(time.time() - job.started_at, 2)
 
@@ -528,18 +854,7 @@ class DeviceQueue:
         job.current_iteration_started_at = None
         self._current = None
         self._current_proc = None
-        self._history.append({
-          "id": job.id, "cmd": job.cmd[:120],
-          "exit_code": exit_code, "elapsed": elapsed,
-          "finished": time.strftime("%H:%M:%S"),
-          "output_file": job.output_file,
-          "repeat": job.repeat,
-          "mode": job.mode,
-          "repeat_completed": job.repeat_completed,
-          "per_iter_estimate_sec": round(job.per_iter_estimate_sec, 2),
-        })
-        if len(self._history) > 50:
-          self._history = self._history[-50:]
+        self._store.save_job(job)
 
       # Write metadata alongside output
       meta_path = Path(job.output_file).parent / "meta.json"
@@ -561,7 +876,7 @@ class DeviceQueue:
       self._queue.task_done()
 
 
-dq = DeviceQueue()
+dq = DeviceQueue(JobStore(DB_PATH))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -753,6 +1068,7 @@ def main():
   print(f"tt-device-queue listening on http://{HOST}:{PORT}")
   print(f"Default timeout: {DEFAULT_TIMEOUT}s")
   print(f"Output dir: {LOG_DIR}")
+  print(f"SQLite db: {DB_PATH}")
   try:
     server.serve_forever()
   except KeyboardInterrupt:

@@ -25,14 +25,17 @@ class QueueServerTest(unittest.TestCase):
   def setUp(self):
     self.temp_dir = tempfile.TemporaryDirectory()
     self.port = free_port()
-    env = os.environ.copy()
-    env["TT_DEVICE_PORT"] = str(self.port)
-    env["TT_DEVICE_LOG_DIR"] = self.temp_dir.name
-    env.pop("PYTHONPATH", None)
+    self.server_env = os.environ.copy()
+    self.server_env["TT_DEVICE_PORT"] = str(self.port)
+    self.server_env["TT_DEVICE_LOG_DIR"] = self.temp_dir.name
+    self.server_env.pop("PYTHONPATH", None)
+    self._start_server()
+
+  def _start_server(self):
     self.server = subprocess.Popen(
       [sys.executable, str(SERVER_PATH)],
       cwd=REPO_ROOT,
-      env=env,
+      env=self.server_env,
       stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT,
       text=True,
@@ -41,6 +44,10 @@ class QueueServerTest(unittest.TestCase):
     self._wait_for_server()
 
   def tearDown(self):
+    self._stop_server()
+    self.temp_dir.cleanup()
+
+  def _stop_server(self):
     if self.server.poll() is None:
       self.server.terminate()
       try:
@@ -48,7 +55,8 @@ class QueueServerTest(unittest.TestCase):
       except subprocess.TimeoutExpired:
         self.server.kill()
         self.server.wait(timeout=5)
-    self.temp_dir.cleanup()
+    if self.server.stdout is not None:
+      self.server.stdout.close()
 
   def _wait_for_server(self):
     deadline = time.time() + 5
@@ -292,6 +300,29 @@ class QueueServerTest(unittest.TestCase):
     )
     self.assertIn("done", second_chunk["content"])
     self.assertTrue(second_chunk["complete"])
+
+  def test_completed_job_logs_survive_server_restart(self):
+    submit = self.submit(self.python_cmd("print('persistent')"), timeout=5)
+    result = self.wait_for_done(submit["job_id"])
+    self.assertEqual(result["exit_code"], 0)
+
+    db_path = Path(self.temp_dir.name) / "jobs.sqlite3"
+    self.assertTrue(db_path.exists())
+    self.assertTrue(Path(submit["output_file"]).exists())
+
+    self._stop_server()
+    self._start_server()
+
+    job = self.get_json(f"/job/{submit['job_id']}")
+    self.assertEqual(job["status"], "done")
+    self.assertEqual(job["exit_code"], 0)
+
+    logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
+    self.assertIn("persistent", logs["content"])
+    self.assertTrue(logs["complete"])
+
+    recent = self.get_json("/status")["recent"]
+    self.assertIn(submit["job_id"], [item["id"] for item in recent])
 
   def test_submit_without_repeat_defaults_to_one(self):
     payload = {

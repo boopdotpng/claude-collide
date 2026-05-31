@@ -8,7 +8,7 @@ AI coding agents cannot use `flock` correctly. They forget the lock, release it 
 
 ## Components
 
-- **server.py** — HTTP server (localhost:5741) that runs a FIFO job queue. Commands execute one at a time via a single worker thread. Output is saved to `/tmp/tt-device-logs/<job_id>/output`.
+- **server.py** — HTTP server (localhost:5741) that runs a FIFO job queue. Commands execute one at a time via a single worker thread. Output is saved to `./logs/<job_id>/output` and mirrored into `./logs/jobs.sqlite3`.
 - **mcp_server.py** — MCP (Model Context Protocol) server that wraps the HTTP API as native tools for AI coding agents. Runs over stdio.
 - **tt-device-queue** — CLI client for submitting jobs and checking results from the shell.
 
@@ -36,7 +36,7 @@ The MCP server enables an **async two-tool pattern**: the agent calls `submit` t
 | `submit(cmd, cwd, timeout, repeat, env)` | No | Enqueue a command, get back a `job_id` immediately |
 | `open_forever(cmd, cwd, timeout, env)` | No | Enqueue an intentionally long-running job that keeps the queue occupied until stopped |
 | `job(job_id)` | No | Fetch structured per-job status, timestamps, repeat progress, and queue position |
-| `logs(job_id, offset, limit)` | No | Read the current output file for a job without blocking |
+| `logs(job_id, offset, limit)` | No | Read current or persisted job output by byte offset without blocking |
 | `tt_smi_status()` | No | Print a one-shot `tt-smi --snapshot` telemetry view without consuming a queue slot |
 | `result(job_id)` | Yes | Wait for a job to finish, return full output |
 | `run(cmd, cwd, timeout, repeat, env)` | Yes | Submit + wait in one call (convenience) |
@@ -49,6 +49,8 @@ The MCP server enables an **async two-tool pattern**: the agent calls `submit` t
 `env` defaults to `{}`. Values are merged into the server's job environment for the subprocess, so agents should pass `env={"TT_USB": "1"}` instead of putting `TT_USB=1` at the front of `cmd`.
 
 `open_forever` is for commands that are intentionally meant to stay alive for a while, like local UI/profile servers. These jobs still use the same FIFO queue and stdout file, but they keep the queue slot occupied until they exit or the agent calls `kill(job_id)`. Manual `kill` sends Ctrl+C first and only escalates to SIGKILL if the process ignores it; timeouts send SIGKILL immediately. The default timeout for `open_forever` jobs is 180 seconds.
+
+Logs are persistent by default. The server stores compatibility output files in `./logs/<job_id>/output` and appends the same bytes to `./logs/jobs.sqlite3` as they are produced. Completed jobs remain available through `job`, `logs`, `result`, and `status` after the server restarts. The whole `./logs/` directory is ignored by git.
 
 ## Setup
 
@@ -135,7 +137,7 @@ tt-device-queue open my-command --serve-ui --flag arg
 # Inspect one job without blocking
 tt-device-queue job <job_id>
 
-# Stream the current output file in chunks
+# Stream current or persisted output in chunks
 tt-device-queue logs <job_id> [offset] [limit]
 
 # Print a tt-smi telemetry snapshot directly without queueing

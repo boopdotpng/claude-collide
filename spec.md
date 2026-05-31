@@ -32,7 +32,7 @@ Each queued job has:
 - `env`: per-job environment variables merged into the subprocess environment
 - `mode`: `run` for normal jobs, `open` for intentionally long-running jobs
 - `status`: `queued`, `running`, or `done`
-- `output_file`: `/tmp/tt-device-logs/<job_id>/output` by default, overridable via `TT_DEVICE_LOG_DIR`
+- `output_file`: `./logs/<job_id>/output` by default, overridable via `TT_DEVICE_LOG_DIR`
 - timestamps: `submitted_at`, `started_at`, `finished_at`
 - results: `exit_code`, `elapsed`
 - repeat progress: `repeat_current`, `repeat_completed`, `first_iteration_elapsed`, `per_iter_estimate_sec`
@@ -54,9 +54,11 @@ Each queued job has:
 ## Output and Metadata Files
 
 - Each job writes stdout/stderr combined into `output_file`.
+- The same output bytes are appended live into `./logs/jobs.sqlite3` by default.
 - Repeated runs append all iterations to the same `output_file`.
 - When a job finishes, `meta.json` is written next to the output file.
 - `meta.json` contains final execution metadata including repeat progress and timing estimates.
+- Completed job metadata and log bytes remain queryable from SQLite after a server restart.
 
 ## Estimation Semantics
 
@@ -148,7 +150,7 @@ Unknown jobs return HTTP 404.
 
 Behavior:
 
-- Reads from the current output file using byte offsets.
+- Reads from SQLite using byte offsets, with a file fallback for legacy rows.
 - `offset < 0` is clamped to `0`.
 - `limit` is clamped to `[1, 65536]`.
 - Returns:
@@ -170,7 +172,7 @@ Returns global queue state:
 
 - `current`: currently running job summary or `null`
 - `pending`: queued jobs in FIFO order with wait and run estimates
-- `recent`: last 10 completed jobs from in-memory history
+- `recent`: last 10 completed jobs from persistent SQLite history
 
 ### POST `/kill`
 
@@ -281,7 +283,7 @@ Implemented tests cover:
 
 ## Not Guaranteed by the Current Implementation
 
-- No persistent job database across server restarts
+- Queued or running jobs do not resume after a server restart; they are marked done with exit code `-1`.
 - No authentication or remote access controls beyond binding to localhost by default
 - No queue prioritization; ordering is strict FIFO
 - No cancellation of queued-but-not-yet-running jobs

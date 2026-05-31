@@ -11,7 +11,7 @@ Tools:
   submit         — Submit a command to the device queue. Returns immediately.
   open_forever   — Submit an intentionally long-running command. Returns immediately.
   job            — Get non-blocking structured status for a job.
-  logs           — Read the current output file for a job without blocking.
+  logs           — Read current or persisted output for a job without blocking.
   tt_smi_status  — Print tt-smi telemetry directly without queueing.
   result         — Wait for a job to finish and return its full output.
   run            — Submit + wait in one call (convenience, blocks until done).
@@ -163,7 +163,7 @@ async def job(job_id: str) -> str:
 
 @server.tool(name="logs")
 async def logs(job_id: str, offset: int = 0, limit: int = 16384) -> str:
-    """Read a chunk of the current output for a job without blocking.
+    """Read a chunk of current or persisted output for a job without blocking.
 
     This is useful for long-running jobs where you want live logs while polling
     job(job_id) for structured status.
