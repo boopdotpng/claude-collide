@@ -47,7 +47,11 @@ server = FastMCP(
         "tools, never through Bash directly. This includes: running Python scripts "
         "that use the device (ttnn, tt-metal, CUDA, etc.), pytest/tests that touch "
         "hardware, benchmarks, tt-smi, firmware tools, and anything that could "
-        "conflict with another agent's device access."
+        "conflict with another agent's device access. Do NOT use this MCP server "
+        "for CPU-only or general development work such as reading files, editing "
+        "code, installing packages, building non-device projects, starting ordinary "
+        "local dev servers, or running tests that do not touch Tenstorrent hardware; "
+        "use the normal shell/tools for those tasks."
     ),
 )
 
@@ -77,6 +81,8 @@ async def submit(
     Use this instead of Bash for ANY command that uses the GPU/device (python
     scripts using ttnn/tt-metal/CUDA, pytest, benchmarks, tt-smi, etc.). Other
     agents may be using the device — the queue prevents conflicts.
+    Do not use this for CPU-only or general development commands; use normal
+    shell/tools unless the command touches Tenstorrent hardware.
 
     Returns immediately. Call result(job_id) when you need the output.
     Do other work (read files, write code, plan) in the meantime. If you have
@@ -116,11 +122,12 @@ async def open_forever(
 ) -> str:
     """Start an intentionally long-running command that should stay open.
 
-    Use this for commands that launch a local web UI or keep streaming logs
-    for a while. The queue slot remains occupied until the
-    process exits or you call kill(job_id). Do NOT call result() right away
-    for these jobs; inspect them with job(job_id) and logs(job_id, offset,
-    limit) while they are alive.
+    Use this only for long-running commands that touch Tenstorrent hardware,
+    such as device-facing profiler/UIs or hardware log streams. Do not use this
+    for ordinary local dev servers, CPU-only logs, or other non-device work.
+    The queue slot remains occupied until the process exits or you call
+    kill(job_id). Do NOT call result() right away for these jobs; inspect them
+    with job(job_id) and logs(job_id, offset, limit) while they are alive.
 
     Args:
         cmd: Shell command to run and keep open
@@ -229,6 +236,8 @@ async def run(
     Use this instead of Bash for ANY command that uses the GPU/device (python
     scripts using ttnn/tt-metal/CUDA, pytest, benchmarks, tt-smi, etc.). Other
     agents may be using the device — the queue prevents conflicts.
+    Do not use this for CPU-only or general development commands; use normal
+    shell/tools unless the command touches Tenstorrent hardware.
 
     Blocks until done. Use this when you have nothing else to do while waiting.
     If you want to do other work while the command runs, use submit()

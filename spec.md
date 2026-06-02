@@ -203,8 +203,12 @@ Implemented tools in `mcp_server.py`:
 MCP behavior notes:
 
 - Queue-backed tools call the HTTP server through shared code in `queue_client.py`.
+- The MCP server is only for commands that touch Tenstorrent hardware. CPU-only
+  and general development work should use normal shell/tools instead.
 - `result` waits until completion, then returns the full output text.
 - `run` is submit + wait.
+- `open_forever` is only for long-running Tenstorrent hardware work, not
+  ordinary local dev servers or CPU-only log streams.
 - `tt_smi_status` does not use the queue and can run concurrently with queued jobs.
 - `reset` is queued work; it is not a direct bypass path.
 

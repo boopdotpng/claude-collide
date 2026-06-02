@@ -31,10 +31,16 @@ The MCP server enables an **async two-tool pattern**: the agent calls `submit` t
 
 ## MCP Tools
 
+The MCP server is only for commands that touch Tenstorrent hardware. Agents
+should use normal shell/tools for CPU-only or general development work such as
+reading files, editing code, installing packages, building non-device projects,
+starting ordinary local dev servers, or running tests that do not touch the
+device.
+
 | Tool | Blocks? | Description |
 |---|---|---|
 | `submit(cmd, cwd, timeout, repeat, env)` | No | Enqueue a command, get back a `job_id` immediately |
-| `open_forever(cmd, cwd, timeout, env)` | No | Enqueue an intentionally long-running job that keeps the queue occupied until stopped |
+| `open_forever(cmd, cwd, timeout, env)` | No | Enqueue an intentionally long-running Tenstorrent hardware job that keeps the queue occupied until stopped |
 | `job(job_id)` | No | Fetch structured per-job status, timestamps, repeat progress, and queue position |
 | `logs(job_id, offset, limit)` | No | Read current or persisted job output by byte offset without blocking |
 | `tt_smi_status()` | No | Print a one-shot `tt-smi --snapshot` telemetry view without consuming a queue slot |
@@ -48,7 +54,7 @@ The MCP server enables an **async two-tool pattern**: the agent calls `submit` t
 
 `env` defaults to `{}`. Values are merged into the server's job environment for the subprocess, so agents should pass `env={"TT_USB": "1"}` instead of putting `TT_USB=1` at the front of `cmd`.
 
-`open_forever` is for commands that are intentionally meant to stay alive for a while, like local UI/profile servers. These jobs still use the same FIFO queue and stdout file, but they keep the queue slot occupied until they exit or the agent calls `kill(job_id)`. Manual `kill` sends Ctrl+C first and only escalates to SIGKILL if the process ignores it; timeouts send SIGKILL immediately. The default timeout for `open_forever` jobs is 180 seconds.
+`open_forever` is for Tenstorrent hardware commands that are intentionally meant to stay alive for a while, like device-facing profiler UIs or hardware log streams. It is not for ordinary local dev servers or CPU-only logs. These jobs still use the same FIFO queue and stdout file, but they keep the queue slot occupied until they exit or the agent calls `kill(job_id)`. Manual `kill` sends Ctrl+C first and only escalates to SIGKILL if the process ignores it; timeouts send SIGKILL immediately. The default timeout for `open_forever` jobs is 180 seconds.
 
 Logs are persistent by default. The server stores compatibility output files in `./logs/<job_id>/output` and appends the same bytes to `./logs/jobs.sqlite3` as they are produced. Completed jobs remain available through `job`, `logs`, `result`, and `status` after the server restarts. The whole `./logs/` directory is ignored by git.
 
