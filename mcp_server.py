@@ -2,19 +2,18 @@
 """
 MCP server for tt-device-queue.
 
-Exposes the device queue as MCP tools so Claude Code agents can submit jobs
-and retrieve results without dumb polling. The agent calls submit()
+Exposes the device queue as MCP tools so Claude Code agents can queue jobs
+and retrieve results without dumb polling. The agent calls queue()
 to enqueue a command (returns immediately), then calls result() when
 it actually needs the output (blocks until done).
 
 Tools:
-  submit         — Submit a command to the device queue. Returns immediately.
-  open_forever   — Submit an intentionally long-running command. Returns immediately.
+  queue          — Queue a command on the device queue. Returns immediately.
+  open_forever   — Queue an intentionally long-running command. Returns immediately.
   job            — Get non-blocking structured status for a job.
   logs           — Read current or persisted output for a job without blocking.
   tt_smi_status  — Print tt-smi telemetry directly without queueing.
   result         — Wait for a job to finish and return its full output.
-  run            — Submit + wait in one call (convenience, blocks until done).
   status         — Show what's running, queued, and recently completed.
   kill           — Gracefully stop a running job, then escalate if needed.
   reset          — Queue a device reset (tt-smi -r).
@@ -28,7 +27,7 @@ import os
 
 from mcp.server.fastmcp import FastMCP
 
-from queue_client import QueueClientError, post, get, run_tt_smi_snapshot, wait_for_job
+from queue_client import post, get, run_tt_smi_snapshot, wait_for_job
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
@@ -68,15 +67,15 @@ async def _get(path: str) -> dict:
     return await asyncio.to_thread(get, BASE, path)
 
 
-@server.tool(name="submit")
-async def submit(
+@server.tool(name="queue")
+async def queue(
     cmd: str,
     cwd: str = "",
     timeout: int = DEFAULT_TIMEOUT,
     repeat: int = 1,
     env: dict[str, str] | None = None,
 ) -> str:
-    """Submit a command to the device queue and return immediately with a job_id.
+    """Queue a command on the device queue and return immediately with a job_id.
 
     Use this instead of Bash for ANY command that uses the GPU/device (python
     scripts using ttnn/tt-metal/CUDA, pytest, benchmarks, tt-smi, etc.). Other
@@ -85,8 +84,7 @@ async def submit(
     shell/tools unless the command touches Tenstorrent hardware.
 
     Returns immediately. Call result(job_id) when you need the output.
-    Do other work (read files, write code, plan) in the meantime. If you have
-    nothing else to do, use run() instead.
+    Do other work (read files, write code, plan) in the meantime.
 
     Args:
         cmd: Shell command to run (e.g. "pytest tests/" or "python train.py")
@@ -161,7 +159,7 @@ async def job(job_id: str) -> str:
     including repeated runs, without waiting for the final result.
 
     Args:
-        job_id: The job_id returned by submit()
+        job_id: The job_id returned by queue()
     """
     result = await _get(f"/job/{job_id}")
 
@@ -176,7 +174,7 @@ async def logs(job_id: str, offset: int = 0, limit: int = 16384) -> str:
     job(job_id) for structured status.
 
     Args:
-        job_id: The job_id returned by submit()
+        job_id: The job_id returned by queue()
         offset: Byte offset to start reading from
         limit: Maximum bytes to read in one call (capped server-side)
     """
@@ -197,7 +195,7 @@ async def tt_smi_status() -> str:
 
 @server.tool(name="result")
 async def result(job_id: str) -> str:
-    """Wait for a previously submitted device job to finish and return its
+    """Wait for a previously queued device job to finish and return its
     full output. Blocks until the job completes.
 
     Only call this when you actually need the result. If you have other work
@@ -205,7 +203,7 @@ async def result(job_id: str) -> str:
     and call this after — the job runs in the background regardless.
 
     Args:
-        job_id: The job_id returned by submit()
+        job_id: The job_id returned by queue()
     """
     result = await _wait_for_job(job_id)
 
@@ -213,58 +211,6 @@ async def result(job_id: str) -> str:
     status = "OK" if exit_code == 0 else f"FAILED (exit code {exit_code})"
 
     lines = [
-        f"Status: {status}",
-        f"Elapsed: {result['elapsed']}s",
-        f"Output file: {result['output_file']}",
-        "",
-        "--- Command Output ---",
-        result["output"],
-    ]
-    return "\n".join(lines)
-
-
-@server.tool(name="run")
-async def run(
-    cmd: str,
-    cwd: str = "",
-    timeout: int = DEFAULT_TIMEOUT,
-    repeat: int = 1,
-    env: dict[str, str] | None = None,
-) -> str:
-    """Submit a command to the device queue and wait for it to complete.
-
-    Use this instead of Bash for ANY command that uses the GPU/device (python
-    scripts using ttnn/tt-metal/CUDA, pytest, benchmarks, tt-smi, etc.). Other
-    agents may be using the device — the queue prevents conflicts.
-    Do not use this for CPU-only or general development commands; use normal
-    shell/tools unless the command touches Tenstorrent hardware.
-
-    Blocks until done. Use this when you have nothing else to do while waiting.
-    If you want to do other work while the command runs, use submit()
-    instead and call result() later.
-
-    Args:
-        cmd: Shell command to run (e.g. "pytest tests/" or "python train.py")
-        cwd: Working directory for the command
-        timeout: Max execution time in seconds (default 120)
-        repeat: Run the command this many times sequentially inside one queued job;
-            all output is appended to the same output file and execution stops on
-            the first failure
-        env: Environment variables to add or override for the command.
-    """
-    submit_result = await _post("/queue", {
-        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
-        "mode": "run", "env": env or {},
-    })
-
-    job_id = submit_result["job_id"]
-    result = await _wait_for_job(job_id)
-
-    exit_code = result["exit_code"]
-    status = "OK" if exit_code == 0 else f"FAILED (exit code {exit_code})"
-
-    lines = [
-        f"Job: {job_id}",
         f"Status: {status}",
         f"Elapsed: {result['elapsed']}s",
         f"Output file: {result['output_file']}",
@@ -358,28 +304,29 @@ async def reset(device: int = 0) -> str:
     command — waits for running jobs to finish first, then resets.
 
     Use this when the device is in a bad state (hangs, errors, firmware
-    issues, NaN outputs). Blocks until the reset completes.
+    issues, NaN outputs).
+
+    Returns immediately after queueing the reset job. Call job(job_id) or
+    result(job_id) to inspect completion.
 
     Args:
         device: Device number to reset (default 0)
     """
     cmd = f"{TT_SMI} -r {device}"
-    submit_result = await _post("/queue", {
+    result = await _post("/queue", {
         "cmd": cmd, "cwd": "", "timeout": 30,
     })
-    job_id = submit_result["job_id"]
-    result = await _wait_for_job(job_id)
 
-    exit_code = result["exit_code"]
-    status = "OK" if exit_code == 0 else f"FAILED (exit code {exit_code})"
-
-    lines = [
-        f"Reset device {device}: {status}",
-        f"Elapsed: {result['elapsed']}s",
-        "",
-        result["output"],
-    ]
-    return "\n".join(lines)
+    return json.dumps({
+        "status": "queued",
+        "message": f"Reset for device {device} was queued.",
+        "job_id": result["job_id"],
+        "output_file": result["output_file"],
+        "position": result["position"],
+        "estimated_wait_sec": result["estimated_wait_sec"],
+        "estimated_run_sec": result.get("estimated_run_sec"),
+        "hint": "Call job(job_id) for status or result(job_id) to wait for reset completion.",
+    }, indent=2)
 
 
 if __name__ == "__main__":

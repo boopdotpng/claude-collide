@@ -6,10 +6,9 @@ It is intended to be the source of truth for feature scope and runtime semantics
 ## Purpose
 
 - Serialize access to a shared hardware resource through a local FIFO queue.
-- Provide three user-facing surfaces:
+- Provide two user-facing surfaces:
   - an HTTP queue server in `server.py`
   - an MCP wrapper in `mcp_server.py`
-  - a shell CLI in `tt-device-queue`
 - Provide one direct non-queued power telemetry path via `tt-smi.py --snapshot`.
 
 ## Process Model
@@ -189,13 +188,12 @@ Behavior:
 
 Implemented tools in `mcp_server.py`:
 
-- `submit(cmd, cwd, timeout, repeat, env)`
+- `queue(cmd, cwd, timeout, repeat, env)`
 - `open_forever(cmd, cwd, timeout, env)`
 - `job(job_id)`
 - `logs(job_id, offset, limit)`
 - `tt_smi_status()`
 - `result(job_id)`
-- `run(cmd, cwd, timeout, repeat, env)`
 - `status()`
 - `kill(job_id="")`
 - `reset(device=0)`
@@ -206,52 +204,21 @@ MCP behavior notes:
 - The MCP server is only for commands that touch Tenstorrent hardware. CPU-only
   and general development work should use normal shell/tools instead.
 - `result` waits until completion, then returns the full output text.
-- `run` is submit + wait.
 - `open_forever` is only for long-running Tenstorrent hardware work, not
   ordinary local dev servers or CPU-only log streams.
 - `tt_smi_status` does not use the queue and can run concurrently with queued jobs.
 - `reset` is queued work; it is not a direct bypass path.
 
-## CLI Surface
-
-Implemented subcommands in `tt-device-queue`:
-
-- `queue <command...>`
-- `open <command...>`
-- `job <job_id>`
-- `logs <job_id> [offset] [limit]`
-- `tt-smi-status`
-- `result <job_id>`
-- `exec <command...>`
-- `kill [job_id]`
-- `status`
-- `reset`
-
-Global CLI options:
-
-- `--timeout N`
-- `--repeat N`
-- `--port PORT`
-- `--cwd DIR`
-- `--env KEY=VALUE`
-
-CLI behavior notes:
-
-- CLI queue/status behavior is intended to mirror the MCP-visible queue behavior.
-- `--env` may be repeated and is sent as the same per-job `env` object exposed by MCP.
-- CLI `tt-smi-status` runs the same direct tt-smi snapshot used by MCP.
-- CLI `kill` maps to HTTP `POST /kill`.
-
 ## Shared Client Layer
 
-`queue_client.py` provides shared helper behavior for CLI and MCP:
+`queue_client.py` provides shared helper behavior for MCP:
 
 - HTTP GET/POST with uniform error translation
 - blocking wait/poll loop for jobs
 - output-file reading for completed results
 - direct `~/tenstorrent/blackhole-py/tt-smi.py --snapshot` invocation
 
-This file exists to keep CLI and MCP behavior aligned without making the CLI depend on MCP transport.
+This file keeps HTTP client behavior and direct telemetry invocation separate from MCP transport code.
 
 ## TT-SMI Status
 
@@ -266,7 +233,7 @@ If no Blackhole PCIe device is found or telemetry fails, the command exits non-z
 ## Installation and Service Behavior
 
 - `install.sh` creates `.venv` and installs `mcp`.
-- `install.sh` symlinks `tt-device-queue` into `~/.local/bin`.
+- `install.sh` removes legacy `tt-device-queue` CLI symlinks from `~/.local/bin`.
 - `install.sh` installs and enables the user systemd service from `tt-device-queue.service`.
 - The systemd unit starts only the HTTP queue server.
 - Updating `server.py` requires restarting the service.

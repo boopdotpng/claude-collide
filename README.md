@@ -10,7 +10,6 @@ AI coding agents cannot use `flock` correctly. They forget the lock, release it 
 
 - **server.py** — HTTP server (localhost:5741) that runs a FIFO job queue. Commands execute one at a time via a single worker thread. Output is saved to `./logs/<job_id>/output` and mirrored into `./logs/jobs.sqlite3`.
 - **mcp_server.py** — MCP (Model Context Protocol) server that wraps the HTTP API as native tools for AI coding agents. Runs over stdio.
-- **tt-device-queue** — CLI client for submitting jobs and checking results from the shell.
 
 ## Architecture
 
@@ -18,16 +17,15 @@ AI coding agents cannot use `flock` correctly. They forget the lock, release it 
 ┌─────────────┐    stdio/MCP     ┌────────────────┐    HTTP     ┌────────────┐
 │  AI Agent   │ ◄──────────────► │  mcp_server.py │ ──────────► │ server.py  │
 │  (claude,   │                  │                │             │ :5741      │
-│   codex,    │                  │  submit        │             │            │
+│   codex,    │                  │  queue         │             │            │
 │   opencode) │                  │  result        │             │  FIFO      │──► shared
-│             │                  │  run           │             │  worker    │    resource
-│             │                  │  status        │             │            │
+│             │                  │  status        │             │  worker    │    resource
 │             │                  │  tt_smi_status │             │            │
 └─────────────┘                  │  reset         │             └────────────┘
                                  └────────────────┘
 ```
 
-The MCP server enables an **async two-tool pattern**: the agent calls `submit` to enqueue a command (returns immediately), does other work (reads files, writes code, plans), then calls `result` when it actually needs the output. This avoids blocking the agent during device execution.
+The MCP server enables an **async two-tool pattern**: the agent calls `queue` to enqueue a command (returns immediately), does other work (reads files, writes code, plans), then calls `result` when it actually needs the output. This avoids blocking the agent during device execution.
 
 ## MCP Tools
 
@@ -39,13 +37,12 @@ device.
 
 | Tool | Blocks? | Description |
 |---|---|---|
-| `submit(cmd, cwd, timeout, repeat, env)` | No | Enqueue a command, get back a `job_id` immediately |
+| `queue(cmd, cwd, timeout, repeat, env)` | No | Enqueue a command, get back a `job_id` immediately |
 | `open_forever(cmd, cwd, timeout, env)` | No | Enqueue an intentionally long-running Tenstorrent hardware job that keeps the queue occupied until stopped |
 | `job(job_id)` | No | Fetch structured per-job status, timestamps, repeat progress, and queue position |
 | `logs(job_id, offset, limit)` | No | Read current or persisted job output by byte offset without blocking |
 | `tt_smi_status()` | No | Print a one-shot `tt-smi --snapshot` telemetry view without consuming a queue slot |
 | `result(job_id)` | Yes | Wait for a job to finish, return full output |
-| `run(cmd, cwd, timeout, repeat, env)` | Yes | Submit + wait in one call (convenience) |
 | `status()` | No | Show running, queued, and recent jobs |
 | `kill(job_id="")` | No | Stop the running job, sending Ctrl+C first and force-killing only if needed |
 | `reset()` | No | Queue a device reset command |
@@ -66,7 +63,7 @@ cd tt-device-queue
 ./install.sh
 ```
 
-The install script creates a venv, installs dependencies, symlinks `tt-device-queue` into `~/.local/bin`, and starts a systemd user service. At the end it prints the commands to register the MCP server with your agent.
+The install script creates a venv, installs dependencies, starts a systemd user service, and removes any legacy CLI symlink from `~/.local/bin`. At the end it prints the commands to register the MCP server with your agent.
 
 ### Manual setup
 
@@ -120,50 +117,6 @@ Drop a `.mcp.json` in your project root:
     }
   }
 }
-```
-
-## CLI Usage
-
-```bash
-# Submit and block until done
-tt-device-queue exec my-command --flag arg
-
-# Add environment variables to the queued command
-tt-device-queue --env TT_USB=1 exec python3 examples/add1.py
-
-# Submit and run it 10 times sequentially
-tt-device-queue --repeat 10 exec my-command --flag arg
-
-# Submit and get job_id back immediately
-tt-device-queue queue my-command --flag arg
-
-# Submit an intentionally long-running command
-tt-device-queue open my-command --serve-ui --flag arg
-
-# Inspect one job without blocking
-tt-device-queue job <job_id>
-
-# Stream current or persisted output in chunks
-tt-device-queue logs <job_id> [offset] [limit]
-
-# Print a tt-smi telemetry snapshot directly without queueing
-tt-device-queue tt-smi-status
-
-# Check result
-tt-device-queue result <job_id>
-
-
-# Stop the currently running job with Ctrl+C first
-tt-device-queue kill
-
-# Stop a specific running open job
-tt-device-queue kill <job_id>
-
-# View queue
-tt-device-queue status
-
-# Queue a device reset
-tt-device-queue reset
 ```
 
 ## License

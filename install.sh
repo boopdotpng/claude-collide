@@ -19,11 +19,12 @@ else
   "$VENV/bin/pip" install mcp
 fi
 
-# 2. Symlink tt-device-queue to ~/.local/bin
-echo "[2/4] Adding tt-device-queue to PATH..."
-mkdir -p ~/.local/bin
-ln -sf "$REPO_DIR/tt-device-queue" ~/.local/bin/tt-device-queue
-echo "  -> ~/.local/bin/tt-device-queue"
+# 2. Remove legacy CLI symlinks
+echo "[2/4] Removing legacy CLI symlinks..."
+if [ -L ~/.local/bin/tt-device-queue ]; then
+  rm ~/.local/bin/tt-device-queue
+  echo "  -> removed ~/.local/bin/tt-device-queue"
+fi
 if [ -L ~/.local/bin/claude-collide ]; then
   rm ~/.local/bin/claude-collide
   echo "  -> removed legacy ~/.local/bin/claude-collide"
