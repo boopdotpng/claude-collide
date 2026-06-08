@@ -1,29 +1,14 @@
 #!/usr/bin/env python3
 """
 MCP server for tt-device-queue.
-
-Exposes the device queue as MCP tools so Claude Code agents can queue jobs
-and retrieve results without dumb polling. The agent calls queue()
-to enqueue a command (returns immediately), then calls result() when
-it actually needs the output (blocks until done).
-
-Tools:
-  queue          — Queue a command on the device queue. Returns immediately.
-  open_forever   — Queue an intentionally long-running command. Returns immediately.
-  job            — Get non-blocking structured status for a job.
-  logs           — Read current or persisted output for a job without blocking.
-  tt_smi_status  — Print tt-smi telemetry directly without queueing.
-  result         — Wait for a job to finish and return its full output.
-  status         — Show what's running, queued, and recently completed.
-  kill           — Gracefully stop a running job, then escalate if needed.
-  reset          — Queue a device reset (tt-smi -r).
-
-Talks to the existing tt-device-queue HTTP server on localhost:5741.
 """
 
 import asyncio
 import json
 import os
+import shlex
+import uuid
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
@@ -32,8 +17,14 @@ from queue_client import post, get, run_tt_smi_snapshot, wait_for_job
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 BASE = f"http://{HOST}:{PORT}"
-DEFAULT_TIMEOUT = 60
+DEFAULT_TIMEOUT = 120
 DEFAULT_OPEN_TIMEOUT = 180
+SCRIPT_DIR = Path(
+    os.environ.get(
+        "TT_DEVICE_SCRIPT_DIR",
+        str(Path(__file__).resolve().parent / "logs" / "mcp-scripts"),
+    )
+)
 
 # Poll interval when waiting for job completion — tight because it's localhost
 POLL_INTERVAL = 0.5
@@ -41,16 +32,7 @@ POLL_INTERVAL = 0.5
 server = FastMCP(
     "tt-device-queue",
     instructions=(
-        "FIFO queue for commands that touch the GPU/device. Other agents may be "
-        "using the device concurrently — all device commands MUST go through these "
-        "tools, never through Bash directly. This includes: running Python scripts "
-        "that use the device (ttnn, tt-metal, CUDA, etc.), pytest/tests that touch "
-        "hardware, benchmarks, tt-smi, firmware tools, and anything that could "
-        "conflict with another agent's device access. Do NOT use this MCP server "
-        "for CPU-only or general development work such as reading files, editing "
-        "code, installing packages, building non-device projects, starting ordinary "
-        "local dev servers, or running tests that do not touch Tenstorrent hardware; "
-        "use the normal shell/tools for those tasks."
+        "Use only for Tenstorrent device commands. Non-Tenstorrent work should use normal shell."
     ),
 )
 
@@ -67,37 +49,26 @@ async def _get(path: str) -> dict:
     return await asyncio.to_thread(get, BASE, path)
 
 
+def _write_python_script(script: str) -> Path:
+    SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    script_path = SCRIPT_DIR / f"{uuid.uuid4().hex[:8]}.py"
+    if not script.endswith("\n"):
+        script += "\n"
+    script_path.write_text(script)
+    return script_path
+
+
 @server.tool(name="queue")
 async def queue(
     cmd: str,
     cwd: str = "",
     timeout: int = DEFAULT_TIMEOUT,
     repeat: int = 1,
-    env: dict[str, str] | None = None,
 ) -> str:
-    """Queue a command on the device queue and return immediately with a job_id.
-
-    Use this instead of Bash for ANY command that uses the GPU/device (python
-    scripts using ttnn/tt-metal/CUDA, pytest, benchmarks, tt-smi, etc.). Other
-    agents may be using the device — the queue prevents conflicts.
-    Do not use this for CPU-only or general development commands; use normal
-    shell/tools unless the command touches Tenstorrent hardware.
-
-    Returns immediately. Call result(job_id) when you need the output.
-    Do other work (read files, write code, plan) in the meantime.
-
-    Args:
-        cmd: Shell command to run (e.g. "pytest tests/" or "python train.py")
-        cwd: Working directory for the command
-        timeout: Max execution time in seconds (default 120)
-        repeat: Run the command this many times sequentially inside one queued job;
-            all output is appended to the same output file and execution stops on
-            the first failure
-        env: Environment variables to add or override for the command.
-    """
+    """Queue device command. Returns job_id. PYTHONPATH includes "."."""
     result = await _post("/queue", {
         "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
-        "mode": "run", "env": env or {},
+        "mode": "run",
     })
 
     return json.dumps({
@@ -107,7 +78,7 @@ async def queue(
         "estimated_wait_sec": result["estimated_wait_sec"],
         "estimated_run_sec": result.get("estimated_run_sec"),
         "repeat": repeat,
-        "hint": "Call result(job_id) when you need the output. Repeat runs still use one job_id and append into one output file.",
+        "hint": "Use result(job_id) for output.",
     }, indent=2)
 
 
@@ -116,27 +87,11 @@ async def open_forever(
     cmd: str,
     cwd: str = "",
     timeout: int = DEFAULT_OPEN_TIMEOUT,
-    env: dict[str, str] | None = None,
 ) -> str:
-    """Start an intentionally long-running command that should stay open.
-
-    Use this only for long-running commands that touch Tenstorrent hardware,
-    such as device-facing profiler/UIs or hardware log streams. Do not use this
-    for ordinary local dev servers, CPU-only logs, or other non-device work.
-    The queue slot remains occupied until the process exits or you call
-    kill(job_id). Do NOT call result() right away for these jobs; inspect them
-    with job(job_id) and logs(job_id, offset, limit) while they are alive.
-
-    Args:
-        cmd: Shell command to run and keep open
-        cwd: Working directory for the command
-        timeout: Max lifetime in seconds before the server force-kills it;
-            defaults to 180s and may be set higher when needed
-        env: Environment variables to add or override for the command.
-    """
+    """Queue long-running device command. Stop with kill(job_id)."""
     result = await _post("/queue", {
         "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": 1,
-        "mode": "open", "env": env or {},
+        "mode": "open",
     })
 
     return json.dumps({
@@ -147,20 +102,42 @@ async def open_forever(
         "estimated_run_sec": result.get("estimated_run_sec"),
         "mode": result.get("mode", "open"),
         "timeout": result.get("timeout", timeout),
-        "hint": "This job keeps the queue blocked while it runs. Use job/logs to monitor it, then call kill(job_id) when done.",
+        "hint": "Use job/logs, then kill(job_id).",
+    }, indent=2)
+
+
+@server.tool(name="queue_python")
+async def queue_python(
+    script: str,
+    cwd: str = "",
+    timeout: int = DEFAULT_TIMEOUT,
+    repeat: int = 1,
+    python: str = "python3",
+    args: list[str] | None = None,
+) -> str:
+    """Write Python script file, then queue it."""
+    script_path = await asyncio.to_thread(_write_python_script, script)
+    cmd = shlex.join([python, str(script_path), *(args or [])])
+    result = await _post("/queue", {
+        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+        "mode": "run",
+    })
+
+    return json.dumps({
+        "job_id": result["job_id"],
+        "script_file": str(script_path),
+        "output_file": result["output_file"],
+        "position": result["position"],
+        "estimated_wait_sec": result["estimated_wait_sec"],
+        "estimated_run_sec": result.get("estimated_run_sec"),
+        "repeat": repeat,
+        "hint": "Use result(job_id) for output.",
     }, indent=2)
 
 
 @server.tool(name="job")
 async def job(job_id: str) -> str:
-    """Get structured status for a queued, running, or completed job.
-
-    This is non-blocking and is the preferred way to poll long-running jobs,
-    including repeated runs, without waiting for the final result.
-
-    Args:
-        job_id: The job_id returned by queue()
-    """
+    """Get job status."""
     result = await _get(f"/job/{job_id}")
 
     return json.dumps(result, indent=2)
@@ -168,16 +145,7 @@ async def job(job_id: str) -> str:
 
 @server.tool(name="logs")
 async def logs(job_id: str, offset: int = 0, limit: int = 16384) -> str:
-    """Read a chunk of current or persisted output for a job without blocking.
-
-    This is useful for long-running jobs where you want live logs while polling
-    job(job_id) for structured status.
-
-    Args:
-        job_id: The job_id returned by queue()
-        offset: Byte offset to start reading from
-        limit: Maximum bytes to read in one call (capped server-side)
-    """
+    """Read job output chunk."""
     result = await _get(f"/logs/{job_id}?offset={offset}&limit={limit}")
 
     return json.dumps(result, indent=2)
@@ -185,26 +153,13 @@ async def logs(job_id: str, offset: int = 0, limit: int = 16384) -> str:
 
 @server.tool(name="tt_smi_status")
 async def tt_smi_status() -> str:
-    """Print a one-shot tt-smi telemetry snapshot without using the queue.
-
-    This tool is safe to run concurrently and does not consume a queue slot.
-    The snapshot includes power telemetry such as TDP and board power limit.
-    """
+    """Run tt-smi snapshot outside the queue."""
     return await asyncio.to_thread(run_tt_smi_snapshot)
 
 
 @server.tool(name="result")
 async def result(job_id: str) -> str:
-    """Wait for a previously queued device job to finish and return its
-    full output. Blocks until the job completes.
-
-    Only call this when you actually need the result. If you have other work
-    to do (reading files, writing code, planning next steps), do that first
-    and call this after — the job runs in the background regardless.
-
-    Args:
-        job_id: The job_id returned by queue()
-    """
+    """Wait for job and return output."""
     result = await _wait_for_job(job_id)
 
     exit_code = result["exit_code"]
@@ -223,9 +178,7 @@ async def result(job_id: str) -> str:
 
 @server.tool(name="status")
 async def status() -> str:
-    """Show what's currently running, queued, and recently completed on the device.
-    Use this to check if the device is busy before submitting work, or to see
-    the history of recent jobs."""
+    """Show queue status."""
     data = await _get("/status")
 
     lines = []
@@ -274,16 +227,7 @@ async def status() -> str:
 
 @server.tool(name="kill")
 async def kill(job_id: str = "") -> str:
-    """Stop a running device job, sending Ctrl+C first and escalating only if
-    it refuses to exit.
-
-    This is the normal way to stop open_forever jobs. If job_id is provided,
-    it must match the currently running job. If omitted, the current running
-    job is stopped.
-
-    Args:
-        job_id: Optional running job id to stop
-    """
+    """Stop running job."""
     payload = {"job_id": job_id} if job_id else {}
     result = await _post("/kill", payload)
 
@@ -299,19 +243,7 @@ TT_SMI = os.path.expanduser("~/tenstorrent/blackhole-py/tt-smi.py")
 
 @server.tool(name="reset")
 async def reset(device: int = 0) -> str:
-    """Reset the Tenstorrent device via the blackhole-py tt-smi.py script
-    (does NOT require tt-kmd). Queued through the FIFO like any other
-    command — waits for running jobs to finish first, then resets.
-
-    Use this when the device is in a bad state (hangs, errors, firmware
-    issues, NaN outputs).
-
-    Returns immediately after queueing the reset job. Call job(job_id) or
-    result(job_id) to inspect completion.
-
-    Args:
-        device: Device number to reset (default 0)
-    """
+    """Queue device reset."""
     cmd = f"{TT_SMI} -r {device}"
     result = await _post("/queue", {
         "cmd": cmd, "cwd": "", "timeout": 30,
@@ -325,7 +257,7 @@ async def reset(device: int = 0) -> str:
         "position": result["position"],
         "estimated_wait_sec": result["estimated_wait_sec"],
         "estimated_run_sec": result.get("estimated_run_sec"),
-        "hint": "Call job(job_id) for status or result(job_id) to wait for reset completion.",
+        "hint": "Use result(job_id) for output.",
     }, indent=2)
 
 

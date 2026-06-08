@@ -794,7 +794,7 @@ class DeviceQueue:
               )
 
             proc = subprocess.Popen(
-              f"exec {job.cmd}", shell=True, executable="/bin/bash",
+              job.cmd, shell=True, executable="/bin/bash",
               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
               cwd=job.cwd or None,
               env=_job_env(job.env),

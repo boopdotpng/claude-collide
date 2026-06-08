@@ -1,5 +1,9 @@
 import json
+import inspect
+import shlex
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import mcp_server
@@ -21,7 +25,6 @@ class McpQueueTest(unittest.IsolatedAsyncioTestCase):
         cwd="/repo",
         timeout=90,
         repeat=3,
-        env={"TT_USB": "1"},
       )
 
     result = json.loads(response)
@@ -36,11 +39,48 @@ class McpQueueTest(unittest.IsolatedAsyncioTestCase):
       "timeout": 90,
       "repeat": 3,
       "mode": "run",
-      "env": {"TT_USB": "1"},
     })
 
   def test_blocking_run_tool_is_removed(self):
     self.assertFalse(hasattr(mcp_server, "run"))
+
+  def test_queue_tool_does_not_expose_env_argument(self):
+    self.assertNotIn("env", inspect.signature(mcp_server.queue).parameters)
+    self.assertNotIn("env", inspect.signature(mcp_server.open_forever).parameters)
+
+  async def test_queue_python_writes_script_and_queues_file(self):
+    queue_result = {
+      "job_id": "python-job",
+      "output_file": "/tmp/python-output",
+      "position": 1,
+      "estimated_wait_sec": 0,
+      "estimated_run_sec": 10,
+    }
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+      with (
+        patch("mcp_server.SCRIPT_DIR", Path(temp_dir)),
+        patch("mcp_server._post", new=AsyncMock(return_value=queue_result)) as mock_post,
+      ):
+        response = await mcp_server.queue_python(
+          script="print('hello')",
+          cwd="/repo",
+          timeout=30,
+          python="python3",
+          args=["--flag"],
+        )
+
+      result = json.loads(response)
+      script_file = Path(result["script_file"])
+      self.assertTrue(script_file.exists())
+      self.assertEqual(script_file.read_text(), "print('hello')\n")
+
+      payload = mock_post.await_args.args[1]
+      cmd_parts = shlex.split(payload["cmd"])
+      self.assertEqual(cmd_parts, ["python3", str(script_file), "--flag"])
+      self.assertEqual(payload["cwd"], "/repo")
+      self.assertEqual(payload["timeout"], 30)
+      self.assertEqual(payload["mode"], "run")
 
 
 class McpResetTest(unittest.IsolatedAsyncioTestCase):

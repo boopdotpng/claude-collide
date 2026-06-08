@@ -188,8 +188,9 @@ Behavior:
 
 Implemented tools in `mcp_server.py`:
 
-- `queue(cmd, cwd, timeout, repeat, env)`
-- `open_forever(cmd, cwd, timeout, env)`
+- `queue(cmd, cwd, timeout, repeat)`
+- `open_forever(cmd, cwd, timeout)`
+- `queue_python(script, cwd, timeout, repeat, python, args)`
 - `job(job_id)`
 - `logs(job_id, offset, limit)`
 - `tt_smi_status()`
@@ -203,6 +204,11 @@ MCP behavior notes:
 - Queue-backed tools call the HTTP server through shared code in `queue_client.py`.
 - The MCP server is only for commands that touch Tenstorrent hardware. CPU-only
   and general development work should use normal shell/tools instead.
+- The HTTP server automatically adds `.` to `PYTHONPATH`; MCP callers do not
+  need a separate env field for the common `PYTHONPATH=.` case.
+- Leading shell assignments such as `MATMUL_PROFILE=1 python3 ...` work.
+- `queue_python` stores large one-off Python snippets as files before queueing,
+  keeping queue metadata readable.
 - `result` waits until completion, then returns the full output text.
 - `open_forever` is only for long-running Tenstorrent hardware work, not
   ordinary local dev servers or CPU-only log streams.

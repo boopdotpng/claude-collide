@@ -87,7 +87,13 @@ class QueueServerTest(unittest.TestCase):
     with urllib.request.urlopen(req, timeout=5) as resp:
       return json.loads(resp.read())
 
-  def submit(self, cmd: str, timeout: int = 5, repeat: int = 1, env: dict | None = None) -> dict:
+  def submit(
+      self,
+      cmd: str,
+      timeout: int = 5,
+      repeat: int = 1,
+      env: dict | None = None,
+  ) -> dict:
     return self.post_json("/queue", {
       "cmd": cmd,
       "cwd": str(REPO_ROOT),
@@ -208,11 +214,15 @@ class QueueServerTest(unittest.TestCase):
     logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
     self.assertIn("1\n", logs["content"])
 
-  def test_inline_env_assignment_still_fails_under_exec_wrapper(self):
-    submit = self.submit("TT_USB=1 python3 -c 'print(123)'", timeout=5)
+  def test_inline_env_assignment_works_under_shell_wrapper(self):
+    cmd = "TT_USB=1 " + self.python_cmd("import os; print(os.environ.get('TT_USB'))")
+    submit = self.submit(cmd, timeout=5)
 
     result = self.wait_for_done(submit["job_id"])
-    self.assertEqual(result["exit_code"], 127)
+    self.assertEqual(result["exit_code"], 0)
+
+    logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
+    self.assertIn("1\n", logs["content"])
 
   def test_job_endpoint_reports_queue_running_and_done_metadata(self):
     first = self.submit("sleep 1", timeout=5)

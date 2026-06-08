@@ -37,8 +37,9 @@ device.
 
 | Tool | Blocks? | Description |
 |---|---|---|
-| `queue(cmd, cwd, timeout, repeat, env)` | No | Enqueue a command, get back a `job_id` immediately |
-| `open_forever(cmd, cwd, timeout, env)` | No | Enqueue an intentionally long-running Tenstorrent hardware job that keeps the queue occupied until stopped |
+| `queue(cmd, cwd, timeout, repeat)` | No | Enqueue a command, get back a `job_id` immediately |
+| `open_forever(cmd, cwd, timeout)` | No | Enqueue an intentionally long-running Tenstorrent hardware job that keeps the queue occupied until stopped |
+| `queue_python(script, cwd, timeout, repeat, python, args)` | No | Write a Python snippet to a script file, then enqueue that script |
 | `job(job_id)` | No | Fetch structured per-job status, timestamps, repeat progress, and queue position |
 | `logs(job_id, offset, limit)` | No | Read current or persisted job output by byte offset without blocking |
 | `tt_smi_status()` | No | Print a one-shot `tt-smi --snapshot` telemetry view without consuming a queue slot |
@@ -49,7 +50,9 @@ device.
 
 `repeat` defaults to `1`. When set higher, the server runs the same command sequentially inside a single queued job, appends all iterations into the same output file, and still returns one `job_id` for the agent to track. It stops immediately on the first failing iteration and exposes repeat progress through `job` and `status`. Initial ETA scales with `repeat`, then refines after the first successful iteration by reusing that iteration's runtime as the per-repeat estimate.
 
-`env` defaults to `{}`. Values are merged into the server's job environment for the subprocess, so agents should pass `env={"TT_USB": "1"}` instead of putting `TT_USB=1` at the front of `cmd`.
+The server automatically prepends `.` to `PYTHONPATH` for queued jobs, so agents do not need to add `PYTHONPATH=.`. Normal leading shell assignments such as `MATMUL_PROFILE=1 python3 examples/matmul_peak.py` work as expected.
+
+Use `queue_python` instead of large `python -c` strings or heredocs. The MCP wrapper writes the snippet into `logs/mcp-scripts/` and queues a short command that runs the generated file.
 
 `open_forever` is for Tenstorrent hardware commands that are intentionally meant to stay alive for a while, like device-facing profiler UIs or hardware log streams. It is not for ordinary local dev servers or CPU-only logs. These jobs still use the same FIFO queue and stdout file, but they keep the queue slot occupied until they exit or the agent calls `kill(job_id)`. Manual `kill` sends Ctrl+C first and only escalates to SIGKILL if the process ignores it; timeouts send SIGKILL immediately. The default timeout for `open_forever` jobs is 180 seconds.
 
