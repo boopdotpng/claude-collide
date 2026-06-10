@@ -39,6 +39,7 @@ class McpQueueTest(unittest.IsolatedAsyncioTestCase):
       "timeout": 90,
       "repeat": 3,
       "mode": "run",
+      "client_id": mcp_server.CLIENT_ID,
     })
 
   def test_blocking_run_tool_is_removed(self):
@@ -81,37 +82,96 @@ class McpQueueTest(unittest.IsolatedAsyncioTestCase):
       self.assertEqual(payload["cwd"], "/repo")
       self.assertEqual(payload["timeout"], 30)
       self.assertEqual(payload["mode"], "run")
+      self.assertEqual(payload["client_id"], mcp_server.CLIENT_ID)
 
 
 class McpResetTest(unittest.IsolatedAsyncioTestCase):
-  async def test_reset_returns_after_queueing(self):
-    queue_result = {
-      "job_id": "reset-job",
-      "output_file": "/tmp/reset-output",
-      "position": 2,
-      "estimated_wait_sec": 45,
-      "estimated_run_sec": 30,
+  async def test_reset_reports_failing_job_instead_of_queueing(self):
+    reset_result = {
+      "action": "scheduled",
+      "device_state": "healthy",
+      "reset_epoch": 3,
+      "hint": "Reset will run before the next job.",
     }
 
     with (
-      patch("mcp_server._post", new=AsyncMock(return_value=queue_result)) as mock_post,
+      patch("mcp_server._post", new=AsyncMock(return_value=reset_result)) as mock_post,
       patch("mcp_server._wait_for_job", new=AsyncMock()) as mock_wait_for_job,
     ):
-      response = await mcp_server.reset(device=1)
+      response = await mcp_server.reset(job_id="failing1")
 
     result = json.loads(response)
-    self.assertEqual(result["status"], "queued")
-    self.assertEqual(result["message"], "Reset for device 1 was queued.")
-    self.assertEqual(result["job_id"], "reset-job")
-    self.assertEqual(result["position"], 2)
-    self.assertEqual(result["estimated_wait_sec"], 45)
-    self.assertIn("result(job_id)", result["hint"])
-    mock_post.assert_awaited_once_with("/queue", {
-      "cmd": f"{mcp_server.TT_SMI} -r 1",
-      "cwd": "",
-      "timeout": 30,
+    self.assertEqual(result["action"], "scheduled")
+    self.assertEqual(result["reset_epoch"], 3)
+    mock_post.assert_awaited_once_with("/reset", {
+      "client_id": mcp_server.CLIENT_ID,
+      "job_id": "failing1",
     })
     mock_wait_for_job.assert_not_awaited()
+
+  async def test_reset_without_job_id_omits_field(self):
+    reset_result = {"action": "joined", "device_state": "resetting", "reset_epoch": 0}
+
+    with patch("mcp_server._post", new=AsyncMock(return_value=reset_result)) as mock_post:
+      response = await mcp_server.reset()
+
+    result = json.loads(response)
+    self.assertEqual(result["action"], "joined")
+    mock_post.assert_awaited_once_with("/reset", {"client_id": mcp_server.CLIENT_ID})
+
+
+class McpCancelTest(unittest.IsolatedAsyncioTestCase):
+  async def test_cancel_posts_job_id(self):
+    cancel_result = {"cancelled": {"id": "victim12", "cmd": "sleep 99", "client": "a"}}
+
+    with patch("mcp_server._post", new=AsyncMock(return_value=cancel_result)) as mock_post:
+      response = await mcp_server.cancel(job_id="victim12")
+
+    self.assertIn("victim12", response)
+    mock_post.assert_awaited_once_with("/cancel", {"job_id": "victim12"})
+
+
+class McpStatusBannerTest(unittest.IsolatedAsyncioTestCase):
+  async def test_status_shows_dead_device_banner(self):
+    status_payload = {
+      "current": None,
+      "pending": [],
+      "recent": [],
+      "device": {
+        "state": "dead",
+        "reset_epoch": 2,
+        "reset_pending": False,
+        "dead_since": "2026-06-09 14:32:00",
+        "dead_reason": "DEVICE UNRECOVERABLE: reboot required",
+      },
+    }
+
+    with patch("mcp_server._get", new=AsyncMock(return_value=status_payload)):
+      response = await mcp_server.status()
+
+    self.assertIn("DEVICE DEAD", response)
+    self.assertIn("reboot required", response)
+
+  async def test_status_shows_resetting_banner_and_clients(self):
+    status_payload = {
+      "current": {
+        "id": "job1", "cmd": "python x.py", "client": "agent-a",
+        "running_sec": 1.0, "repeat": 1,
+      },
+      "pending": [
+        {"id": "job2", "cmd": "python y.py", "client": "agent-b",
+         "waiting_sec": 0.5, "repeat": 1},
+      ],
+      "recent": [],
+      "device": {"state": "resetting", "reset_epoch": 0, "reset_pending": False},
+    }
+
+    with patch("mcp_server._get", new=AsyncMock(return_value=status_payload)):
+      response = await mcp_server.status()
+
+    self.assertIn("DEVICE RESET in progress", response)
+    self.assertIn("(agent-a)", response)
+    self.assertIn("(agent-b)", response)
 
 
 if __name__ == "__main__":

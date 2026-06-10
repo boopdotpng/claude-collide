@@ -5,7 +5,12 @@ It is intended to be the source of truth for feature scope and runtime semantics
 
 ## Purpose
 
-- Serialize access to a shared hardware resource through a local FIFO queue.
+- Serialize access to a shared hardware resource through a local job queue.
+- Schedule fairly across many concurrent agents: round-robin across `client_id`s,
+  FIFO within a `client_id`, so no single agent can dominate the queue.
+- Manage device health centrally: coalesce reset requests, hold the queue while
+  a reset runs, and stop everything with a reboot-required message when the
+  device does not come back.
 - Provide two user-facing surfaces:
   - an HTTP queue server in `server.py`
   - an MCP wrapper in `mcp_server.py`
@@ -19,6 +24,51 @@ It is intended to be the source of truth for feature scope and runtime semantics
 - The installed systemd user service runs `server.py`, not `mcp_server.py`.
 - `mcp_server.py` runs over stdio and is started by the MCP client on demand.
 
+## Client Identity and Fair Scheduling
+
+- Every submission carries a `client_id` (default `anon` when omitted).
+- One MCP server process equals one agent session: `mcp_server.py` generates a
+  stable `CLIENT_ID` at startup (`TT_QUEUE_CLIENT_ID` env override, otherwise
+  `agent-<8 hex>`), and attaches it to every queue submission.
+- The scheduler keeps one FIFO subqueue per `client_id` and serves clients in
+  round-robin order: serve the head of the rotation, then rotate that client to
+  the back. Clients with empty subqueues leave the rotation.
+- Within a single client, submission order is preserved (FIFO).
+- Reported `position` and `estimated_wait_sec` are computed by simulating the
+  round-robin dispatch order over the current subqueues.
+- Identity is cooperative, not authenticated. Raw HTTP callers that omit
+  `client_id` all share the `anon` bucket, which participates in the rotation
+  as one client.
+
+## Device Health State Machine
+
+- States: `healthy` -> `resetting` -> `healthy` or `dead`.
+- The server owns resets. `POST /reset` is a report/request, not a queued job.
+- Every job records the `reset_epoch` it ran under (set when the job starts).
+  The epoch increments after each successful reset.
+- Coalescing rules for `POST /reset {"job_id": ...}`:
+  - job's epoch < current epoch -> `already_reset` (no new reset; resubmit)
+  - reset pending or in progress -> `joined`
+  - otherwise -> `scheduled` (the worker runs it before dispatching more jobs)
+- The currently running job is allowed to finish (bounded by its timeout);
+  the reset runs before the next dispatch.
+- Reset procedure (worker thread): run `TT_DEVICE_RESET_CMD`, then verify with
+  `TT_DEVICE_PROBE_CMD`. On probe failure, retry up to `TT_DEVICE_RESET_RETRIES`
+  more times (default 1). Each reset run is recorded as a synthetic job with
+  `mode=reset` and `client_id=system`, visible in status/history/logs.
+- Probe success: epoch increments, state returns to `healthy`, queue resumes.
+- Probe failure after retries: state becomes `dead`:
+  - all queued jobs are failed with exit code `-1` and a
+    `DEVICE UNRECOVERABLE ... host reboot is required` message appended to
+    their logs (agents blocked on `result` receive it via the normal poll)
+  - new submissions are rejected with HTTP 503 and the same message
+  - further `/reset` requests are rejected with HTTP 503
+  - `/status` reports `device.state = "dead"` with `dead_since`/`dead_reason`
+- Dead state is in-memory only: a server restart (e.g. after host reboot)
+  starts back at `healthy` with `reset_epoch = 0`.
+- Defaults for reset/probe commands come from `tt-smi.py` (`-r 0` and
+  `--snapshot`); both are overridable via environment for testing.
+
 ## Job Model
 
 Each queued job has:
@@ -29,7 +79,10 @@ Each queued job has:
 - `timeout`: total timeout budget for the whole job, not per repeat iteration
 - `repeat`: number of sequential executions inside the same job, minimum `1`
 - `env`: per-job environment variables merged into the subprocess environment
-- `mode`: `run` for normal jobs, `open` for intentionally long-running jobs
+- `mode`: `run` for normal jobs, `open` for intentionally long-running jobs,
+  `reset` for server-managed device resets
+- `client_id`: fairness unit for scheduling; defaults to `anon`, max 128 chars
+- `reset_epoch`: the device reset epoch the job ran under
 - `status`: `queued`, `running`, or `done`
 - `output_file`: `./logs/<job_id>/output` by default, overridable via `TT_DEVICE_LOG_DIR`
 - timestamps: `submitted_at`, `started_at`, `finished_at`
@@ -83,7 +136,8 @@ Request JSON:
   "timeout": 120,
   "repeat": 1,
   "mode": "run",
-  "env": {"TT_USB": "1"}
+  "env": {"TT_USB": "1"},
+  "client_id": "agent-1a2b3c4d"
 }
 ```
 
@@ -94,15 +148,40 @@ Behavior:
 - `mode` defaults to `run` and must be either `run` or `open`.
 - `mode=open` defaults to `180s` timeout when one is not provided.
 - `env` defaults to `{}` and must be an object whose names and values are strings.
+- `client_id` defaults to `anon`; must be a non-empty string of at most 128 chars.
+- Returns HTTP 503 with the reboot-required message when the device is dead.
 - Returns HTTP 200 with:
   - `job_id`
   - `output_file`
-  - `position` where `0` means starts immediately if idle/current slot is free
+  - `position` where `0` means starts immediately if idle/current slot is free;
+    computed against the simulated round-robin dispatch order
   - `estimated_wait_sec`
   - `estimated_run_sec`
   - `repeat`
   - `mode`
   - `timeout`
+
+### POST `/reset`
+
+Request JSON: `{"job_id": "<failing job, optional>"}`
+
+- Reports a broken device / requests a reset. Never queues a job.
+- Returns HTTP 200 with `action` one of:
+  - `already_reset`: the referenced job ran before the latest reset; resubmit
+  - `joined`: a reset is already pending or in progress
+  - `scheduled`: a reset will run before the next job dispatch
+- Plus `device_state`, `reset_epoch`, and a human-readable `hint`.
+- Unknown `job_id` returns HTTP 404. Dead device returns HTTP 503.
+
+### POST `/cancel`
+
+Request JSON: `{"job_id": "..."}`
+
+- Cancels a queued (not yet running) job: removes it from its client's
+  subqueue, appends a `Cancelled while queued` log line, and marks it done
+  with exit code `-1`.
+- Running or finished jobs return HTTP 409 (use `/kill` for running jobs).
+- Unknown jobs return HTTP 404. Missing `job_id` returns HTTP 400.
 
 ### GET `/result/<job_id>`
 
@@ -169,9 +248,12 @@ Unknown jobs return HTTP 404.
 
 Returns global queue state:
 
-- `current`: currently running job summary or `null`
-- `pending`: queued jobs in FIFO order with wait and run estimates
+- `current`: currently running job summary (including `client`) or `null`
+- `pending`: queued jobs in simulated round-robin dispatch order with wait and
+  run estimates and the owning `client`
 - `recent`: last 10 completed jobs from persistent SQLite history
+- `device`: health block with `state` (`healthy|resetting|dead`),
+  `reset_epoch`, `reset_pending`, `last_reset_at`, `dead_since`, `dead_reason`
 
 ### POST `/kill`
 
@@ -197,11 +279,20 @@ Implemented tools in `mcp_server.py`:
 - `result(job_id)`
 - `status()`
 - `kill(job_id="")`
-- `reset(device=0)`
+- `cancel(job_id)`
+- `reset(job_id="")`
 
 MCP behavior notes:
 
 - Queue-backed tools call the HTTP server through shared code in `queue_client.py`.
+- The MCP process generates a per-session `CLIENT_ID` at startup
+  (`TT_QUEUE_CLIENT_ID` env override) and attaches it to every submission;
+  this is the fairness unit for round-robin scheduling.
+- `reset(job_id)` reports a broken device. The server coalesces resets per
+  epoch; the expected agent protocol is: job fails strangely -> `reset(job_id)`
+  -> check `action` -> resubmit the job once the device is healthy.
+- `cancel(job_id)` cancels one of the agent's queued jobs.
+- `status()` prints a banner when the device is resetting or dead.
 - The MCP server is only for commands that touch Tenstorrent hardware. CPU-only
   and general development work should use normal shell/tools instead.
 - The HTTP server automatically adds `.` to `PYTHONPATH`; MCP callers do not
@@ -213,7 +304,8 @@ MCP behavior notes:
 - `open_forever` is only for long-running Tenstorrent hardware work, not
   ordinary local dev servers or CPU-only log streams.
 - `tt_smi_status` does not use the queue and can run concurrently with queued jobs.
-- `reset` is queued work; it is not a direct bypass path.
+- `reset` is not queued work and not a direct bypass path; it is a health
+  report handled by the server's device state machine.
 
 ## Shared Client Layer
 
@@ -256,13 +348,26 @@ Implemented tests cover:
 - log chunk reading with offsets and completion detection
 - repeat-aware ETA initialization and refinement after first iteration
 - `repeat` defaulting to `1`
+- round-robin interleaving across clients and FIFO within a client
+- `client_id` defaulting, validation, and visibility in job/status payloads
+- cancellation of queued jobs (and 404/409 for unknown/running jobs)
+- legacy SQLite databases gaining `client_id`/`reset_epoch` columns on startup
+- reset coalescing: concurrent requests run exactly one reset; stale-epoch
+  reports are no-ops
+- the queue holding jobs during a reset and resuming after success
+- failed reset draining the queue with the reboot message, rejecting new
+  submissions and reset requests with HTTP 503, and recovery after restart
+- MCP payloads carrying `CLIENT_ID`, the report-style `reset` tool, `cancel`,
+  and device banners in `status`
 - `tt_smi_status` snapshot invocation and error handling in `queue_client.py`
 
 ## Not Guaranteed by the Current Implementation
 
 - Queued or running jobs do not resume after a server restart; they are marked done with exit code `-1`.
 - No authentication or remote access controls beyond binding to localhost by default
-- No queue prioritization; ordering is strict FIFO
-- No cancellation of queued-but-not-yet-running jobs
+- Client identity is cooperative (self-reported), not authenticated
+- No preemption: a reset waits for the currently running job to finish or time out
+- Device health state is not persisted; a restart returns to `healthy`
+- No multi-device support yet; one worker, one device, one health state
 - No streaming MCP transport for partial `result` output
 - No server-side enforcement that a command actually targets device hardware

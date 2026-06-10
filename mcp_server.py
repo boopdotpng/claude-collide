@@ -19,6 +19,10 @@ PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 BASE = f"http://{HOST}:{PORT}"
 DEFAULT_TIMEOUT = 120
 DEFAULT_OPEN_TIMEOUT = 180
+
+# One MCP server process == one agent session. This id is the fairness unit:
+# the queue server round-robins across client ids so no agent can dominate.
+CLIENT_ID = os.environ.get("TT_QUEUE_CLIENT_ID") or f"agent-{uuid.uuid4().hex[:8]}"
 SCRIPT_DIR = Path(
     os.environ.get(
         "TT_DEVICE_SCRIPT_DIR",
@@ -68,7 +72,7 @@ async def queue(
     """Queue device command. Returns job_id. PYTHONPATH includes "."."""
     result = await _post("/queue", {
         "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
-        "mode": "run",
+        "mode": "run", "client_id": CLIENT_ID,
     })
 
     return json.dumps({
@@ -91,7 +95,7 @@ async def open_forever(
     """Queue long-running device command. Stop with kill(job_id)."""
     result = await _post("/queue", {
         "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": 1,
-        "mode": "open",
+        "mode": "open", "client_id": CLIENT_ID,
     })
 
     return json.dumps({
@@ -120,7 +124,7 @@ async def queue_python(
     cmd = shlex.join([python, str(script_path), *(args or [])])
     result = await _post("/queue", {
         "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
-        "mode": "run",
+        "mode": "run", "client_id": CLIENT_ID,
     })
 
     return json.dumps({
@@ -183,9 +187,20 @@ async def status() -> str:
 
     lines = []
 
+    device = data.get("device") or {}
+    state = device.get("state", "healthy")
+    if state == "dead":
+        reason = device.get("dead_reason") or "reboot required"
+        lines.append(f"!!! DEVICE DEAD since {device.get('dead_since')} — {reason}")
+        lines.append("")
+    elif state == "resetting" or device.get("reset_pending"):
+        lines.append("!!! DEVICE RESET in progress — jobs are held until the device is healthy")
+        lines.append("")
+
     current = data.get("current")
     if current:
-        lines.append(f"RUNNING: [{current['id']}] {current['cmd']}")
+        client = f" ({current['client']})" if current.get("client") else ""
+        lines.append(f"RUNNING: [{current['id']}]{client} {current['cmd']}")
         if current.get("mode") == "open":
             lines.append("         mode open")
         repeat = current.get("repeat", 1)
@@ -203,7 +218,8 @@ async def status() -> str:
     if pending:
         lines.append(f"\nQUEUED ({len(pending)}):")
         for p in pending:
-            lines.append(f"  [{p['id']}] {p['cmd']}")
+            client = f" ({p['client']})" if p.get("client") else ""
+            lines.append(f"  [{p['id']}]{client} {p['cmd']}")
             if p.get("mode") == "open":
                 lines.append("           mode open")
             repeat = f"  repeat {p['repeat']}x" if p.get('repeat', 1) > 1 else ""
@@ -238,27 +254,32 @@ async def kill(job_id: str = "") -> str:
     return "Nothing running to kill."
 
 
-TT_SMI = os.path.expanduser("~/tenstorrent/blackhole-py/tt-smi.py")
-
-
 @server.tool(name="reset")
-async def reset(device: int = 0) -> str:
-    """Queue device reset."""
-    cmd = f"{TT_SMI} -r {device}"
-    result = await _post("/queue", {
-        "cmd": cmd, "cwd": "", "timeout": 30,
-    })
+async def reset(job_id: str = "") -> str:
+    """Report a broken device / request a reset. Pass the job_id that failed.
 
-    return json.dumps({
-        "status": "queued",
-        "message": f"Reset for device {device} was queued.",
-        "job_id": result["job_id"],
-        "output_file": result["output_file"],
-        "position": result["position"],
-        "estimated_wait_sec": result["estimated_wait_sec"],
-        "estimated_run_sec": result.get("estimated_run_sec"),
-        "hint": "Use result(job_id) for output.",
-    }, indent=2)
+    The server coalesces resets: if the device was already reset since your
+    job ran, no new reset happens — just resubmit your job. The queue is held
+    while a reset runs.
+    """
+    payload = {"client_id": CLIENT_ID}
+    if job_id:
+        payload["job_id"] = job_id
+    result = await _post("/reset", payload)
+
+    result.setdefault("hint", "")
+    return json.dumps(result, indent=2)
+
+
+@server.tool(name="cancel")
+async def cancel(job_id: str) -> str:
+    """Cancel one of your queued (not yet running) jobs. Use kill for running jobs."""
+    result = await _post("/cancel", {"job_id": job_id})
+
+    cancelled = result.get("cancelled")
+    if cancelled:
+        return f"Cancelled queued job [{cancelled['id']}] {cancelled['cmd']}"
+    return json.dumps(result, indent=2)
 
 
 if __name__ == "__main__":

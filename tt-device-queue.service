@@ -7,6 +7,7 @@ Type=simple
 ExecStart=%h/tenstorrent/tt-device-queue/.venv/bin/python3 %h/tenstorrent/tt-device-queue/server.py
 Restart=on-failure
 RestartSec=2
+OOMPolicy=continue
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
 
 [Install]

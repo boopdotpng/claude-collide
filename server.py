@@ -2,12 +2,25 @@
 """
 tt-device-queue server — serializes access to the Tenstorrent device.
 
-HTTP API on localhost:5741. Jobs run one at a time (FIFO).
-Output is saved to ./logs/<job_id>/output by default.
+HTTP API on localhost:5741. Jobs run one at a time. Scheduling is round-robin
+across client_ids (one agent = one client) and FIFO within a client, so no
+single agent can dominate the queue. Output is saved to ./logs/<job_id>/output
+by default.
+
+Device health is managed by the server: resets are coalesced (per reset epoch),
+the queue is held while a reset runs, and if the device does not come back the
+server enters a "dead" state — all queued jobs are failed with a reboot-required
+message and new submissions are rejected with HTTP 503.
 
 Endpoints:
-  POST /queue   {"cmd": "...", "cwd": "...", "timeout": 120, "repeat": 1}
+  POST /queue   {"cmd": "...", "cwd": "...", "timeout": 120, "repeat": 1,
+                 "client_id": "agent-xyz"}
                 -> {"job_id", "output_file", "position", "estimated_wait_sec"}
+
+  POST /reset   {"job_id": "<failing job, optional>"}
+                -> {"action": "scheduled|joined|already_reset", ...}
+
+  POST /cancel  {"job_id": "..."}  (queued jobs only; use /kill for running)
 
   GET  /result/<job_id>
                 -> {"status": "queued|running|done", "position", "estimated_wait_sec"}
@@ -17,7 +30,7 @@ Endpoints:
                 -> full job metadata including repeat progress, timestamps, and
                    queue position when still pending
 
-  GET  /status  -> {"current", "pending", "recent"}
+  GET  /status  -> {"current", "pending", "recent", "device"}
 """
 
 import json
@@ -29,9 +42,9 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from queue import Queue
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
 
@@ -45,6 +58,22 @@ DB_PATH = LOG_DIR / "jobs.sqlite3"
 DEFAULT_ITER_ESTIMATE_SEC = 10
 MAX_LOG_READ = 64 * 1024
 STOP_GRACE_SEC = 8
+DEFAULT_CHILD_OOM_SCORE_ADJ = "500"
+DEFAULT_CLIENT_ID = "anon"
+MAX_CLIENT_ID_LEN = 128
+
+TT_SMI_PATH = os.environ.get(
+  "TT_DEVICE_TT_SMI", os.path.expanduser("~/tenstorrent/blackhole-py/tt-smi.py")
+)
+RESET_CMD = os.environ.get("TT_DEVICE_RESET_CMD", f"{TT_SMI_PATH} -r 0")
+PROBE_CMD = os.environ.get("TT_DEVICE_PROBE_CMD", f"{TT_SMI_PATH} --snapshot")
+RESET_RETRIES = int(os.environ.get("TT_DEVICE_RESET_RETRIES", "1"))
+HEALTH_CMD_TIMEOUT = int(os.environ.get("TT_DEVICE_HEALTH_CMD_TIMEOUT", "60"))
+REBOOT_REQUIRED_MSG = (
+  "DEVICE UNRECOVERABLE: reset did not bring the device back (tt-smi probe "
+  "failing). A host reboot is required. All queued jobs were aborted — end "
+  "your turn and do not submit further jobs."
+)
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -61,10 +90,23 @@ def _job_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
   return env
 
 
+def _job_shell_script(cmd: str) -> str:
+  return "\n".join([
+    "printf '%s\\n' \"${TT_DEVICE_CHILD_OOM_SCORE_ADJ:-"
+    f"{DEFAULT_CHILD_OOM_SCORE_ADJ}"
+    "}\" > /proc/$$/oom_score_adj 2>/dev/null || true",
+    cmd,
+  ])
+
+
 def _format_timestamp(ts: float | None) -> str | None:
   if ts is None:
     return None
   return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+class DeviceDeadError(RuntimeError):
+  """Raised when the device is dead and a host reboot is required."""
 
 
 @dataclass
@@ -76,6 +118,8 @@ class Job:
   repeat: int
   env: dict[str, str] = field(default_factory=dict)
   mode: str = "run"
+  client_id: str = DEFAULT_CLIENT_ID
+  reset_epoch: int = 0
   submitted: float = field(default_factory=time.time)
   # Filled in by worker
   status: str = "queued"        # queued -> running -> done
@@ -131,9 +175,22 @@ class JobStore:
           stop_requested_at REAL,
           stop_escalated_at REAL,
           log_size INTEGER NOT NULL DEFAULT 0,
-          updated_at REAL NOT NULL
+          updated_at REAL NOT NULL,
+          client_id TEXT NOT NULL DEFAULT 'anon',
+          reset_epoch INTEGER NOT NULL DEFAULT 0
         )
       """)
+      existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+      }
+      if "client_id" not in existing:
+        conn.execute(
+          "ALTER TABLE jobs ADD COLUMN client_id TEXT NOT NULL DEFAULT 'anon'"
+        )
+      if "reset_epoch" not in existing:
+        conn.execute(
+          "ALTER TABLE jobs ADD COLUMN reset_epoch INTEGER NOT NULL DEFAULT 0"
+        )
       conn.execute("""
         CREATE TABLE IF NOT EXISTS log_chunks (
           job_id TEXT NOT NULL,
@@ -195,9 +252,9 @@ class JobStore:
           started_at, finished_at, exit_code, elapsed, output_file,
           repeat_current, repeat_completed, first_iteration_elapsed,
           per_iter_estimate_sec, stop_requested_at, stop_escalated_at,
-          log_size, updated_at
+          log_size, updated_at, client_id, reset_epoch
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           cmd = excluded.cmd,
           cwd = excluded.cwd,
@@ -219,7 +276,9 @@ class JobStore:
           stop_requested_at = excluded.stop_requested_at,
           stop_escalated_at = excluded.stop_escalated_at,
           log_size = excluded.log_size,
-          updated_at = excluded.updated_at
+          updated_at = excluded.updated_at,
+          client_id = excluded.client_id,
+          reset_epoch = excluded.reset_epoch
         """,
         (
           job.id, job.cmd, job.cwd, job.timeout, job.repeat,
@@ -228,7 +287,7 @@ class JobStore:
           job.elapsed, job.output_file, job.repeat_current, job.repeat_completed,
           job.first_iteration_elapsed, job.per_iter_estimate_sec,
           job.stop_requested_at, job.stop_escalated_at, job.log_size,
-          time.time(),
+          time.time(), job.client_id, job.reset_epoch,
         ),
       )
 
@@ -313,6 +372,8 @@ class JobStore:
       repeat=int(row["repeat"]),
       env=env,
       mode=row["mode"],
+      client_id=row["client_id"] or DEFAULT_CLIENT_ID,
+      reset_epoch=int(row["reset_epoch"] or 0),
       submitted=float(row["submitted"]),
       status=row["status"],
       exit_code=row["exit_code"],
@@ -342,6 +403,7 @@ class JobStore:
       "output_file": row["output_file"],
       "repeat": row["repeat"],
       "mode": row["mode"],
+      "client": row["client_id"] or DEFAULT_CLIENT_ID,
       "repeat_completed": row["repeat_completed"],
       "per_iter_estimate_sec": round(row["per_iter_estimate_sec"], 2),
     }
@@ -350,12 +412,51 @@ class JobStore:
 class DeviceQueue:
   def __init__(self, store: JobStore):
     self._store = store
-    self._queue: Queue[Job] = Queue()
     self._jobs: dict[str, Job] = {}          # all jobs by id
-    self._pending_ids: list[str] = []        # ordered list of queued job ids
+    self._pending: dict[str, deque[str]] = {}  # client_id -> queued job ids (FIFO)
+    self._rr_clients: list[str] = []         # round-robin rotation of clients
     self._current: Job | None = None
     self._current_proc: subprocess.Popen | None = None
     self._lock = threading.Lock()
+    self._cond = threading.Condition(self._lock)
+    # Device health state machine: healthy -> resetting -> healthy | dead
+    self._device_state = "healthy"
+    self._reset_epoch = 0
+    self._reset_pending = False
+    self._last_reset_at: float | None = None
+    self._dead_since: float | None = None
+    self._dead_reason: str | None = None
+
+  def _dispatch_order_locked(self) -> list[str]:
+    """Simulate the round-robin scheduler over current subqueues.
+
+    Returns the flat list of pending job ids in predicted dispatch order.
+    """
+    queues = {c: list(q) for c, q in self._pending.items() if q}
+    rotation = [c for c in self._rr_clients if c in queues]
+    order: list[str] = []
+    while rotation:
+      client = rotation.pop(0)
+      order.append(queues[client].pop(0))
+      if queues[client]:
+        rotation.append(client)
+    return order
+
+  def _pick_job_locked(self) -> Job | None:
+    """Pop the next job per round-robin. Serve rotation head, rotate client."""
+    while self._rr_clients:
+      client = self._rr_clients.pop(0)
+      q = self._pending.get(client)
+      if not q:
+        self._pending.pop(client, None)
+        continue
+      job_id = q.popleft()
+      if q:
+        self._rr_clients.append(client)
+      else:
+        self._pending.pop(client, None)
+      return self._jobs[job_id]
+    return None
 
   def _estimated_remaining_locked(self, job: Job, now: float | None = None) -> int:
     now = now or time.time()
@@ -397,10 +498,15 @@ class DeviceQueue:
     with self._lock:
       return self._estimated_remaining_locked(job)
 
-  def estimated_wait_for_position(self, position: int) -> int:
+  def queue_position(self, job_id: str) -> tuple[int, int]:
+    """(0-indexed dispatch position, estimated wait sec). (-1, 0) if not pending."""
     with self._lock:
-      pending_slice = self._pending_ids[:max(position, 0)]
-      return self._estimate_wait_locked(pending_slice, include_current=True)
+      order = self._dispatch_order_locked()
+      try:
+        pos = order.index(job_id)
+      except ValueError:
+        return -1, 0
+      return pos, self._estimate_wait_locked(order[:pos], include_current=True)
 
   def submit(
       self,
@@ -410,6 +516,7 @@ class DeviceQueue:
       repeat: int,
       mode: str = "run",
       env: dict[str, str] | None = None,
+      client_id: str = DEFAULT_CLIENT_ID,
   ) -> tuple["Job", int, int]:
     """Submit a job. Returns (job, position, estimated_wait_sec) computed atomically."""
     if repeat < 1:
@@ -429,6 +536,11 @@ class DeviceQueue:
         raise ValueError("env names must not contain '='")
       if not isinstance(value, str):
         raise ValueError("env values must be strings")
+    if not isinstance(client_id, str) or not client_id.strip():
+      raise ValueError("client_id must be a non-empty string")
+    client_id = client_id.strip()
+    if len(client_id) > MAX_CLIENT_ID_LEN:
+      raise ValueError(f"client_id must be at most {MAX_CLIENT_ID_LEN} characters")
 
     job_id = uuid.uuid4().hex[:8]
     output_dir = LOG_DIR / job_id
@@ -437,20 +549,98 @@ class DeviceQueue:
 
     job = Job(
       id=job_id, cmd=cmd, cwd=cwd, timeout=timeout, repeat=repeat, mode=mode,
-      env=dict(env), output_file=output_file,
+      env=dict(env), client_id=client_id, output_file=output_file,
     )
 
-    with self._lock:
+    with self._cond:
+      if self._device_state == "dead":
+        raise DeviceDeadError(self._dead_reason or REBOOT_REQUIRED_MSG)
+      job.reset_epoch = self._reset_epoch
       self._jobs[job_id] = job
-      self._pending_ids.append(job_id)
+      if client_id not in self._pending:
+        self._pending[client_id] = deque()
+        self._rr_clients.append(client_id)
+      self._pending[client_id].append(job_id)
       # Compute position while still holding the lock, before the worker can dequeue
-      pos = self._pending_ids.index(job_id)
+      order = self._dispatch_order_locked()
+      pos = order.index(job_id)
       jobs_ahead = pos + (1 if self._current else 0)
-      wait_sec = self._estimate_wait_locked(self._pending_ids[:pos], include_current=True)
+      wait_sec = self._estimate_wait_locked(order[:pos], include_current=True)
+      self._store.save_job(job)
+      self._cond.notify_all()
 
-    self._store.save_job(job)
-    self._queue.put(job)
     return job, jobs_ahead, wait_sec
+
+  def cancel_job(self, job_id: str) -> dict:
+    """Cancel a queued (not yet running) job.
+
+    Raises KeyError for unknown jobs and ValueError for non-queued jobs.
+    """
+    with self._cond:
+      job = self._jobs.get(job_id)
+      if job is None:
+        if self._store.load_job(job_id) is None:
+          raise KeyError(job_id)
+        raise ValueError(f"Job {job_id} is not queued")
+      if job.status != "queued":
+        raise ValueError(
+          f"Job {job_id} is not queued (status: {job.status}); use /kill for running jobs"
+        )
+      q = self._pending.get(job.client_id)
+      if q is not None:
+        try:
+          q.remove(job_id)
+        except ValueError:
+          pass
+
+    # Job can no longer be picked by the worker — finish it outside the lock.
+    try:
+      with open(job.output_file, "ab") as f:
+        self._append_output(job, f, b"\n[tt-device-queue] Cancelled while queued\n")
+    except OSError:
+      pass
+    with self._cond:
+      job.status = "done"
+      job.exit_code = -1
+      job.finished_at = time.time()
+      self._store.save_job(job)
+    return {"id": job.id, "cmd": job.cmd[:120], "client": job.client_id}
+
+  def request_reset(self, job_id: str | None = None) -> dict:
+    """Request a device reset, coalescing duplicates via reset epochs.
+
+    Raises DeviceDeadError when the device is dead and KeyError for unknown jobs.
+    """
+    with self._cond:
+      if self._device_state == "dead":
+        raise DeviceDeadError(self._dead_reason or REBOOT_REQUIRED_MSG)
+      epoch = self._reset_epoch
+      if job_id:
+        job = self._jobs.get(job_id) or self._store.load_job(job_id)
+        if job is None:
+          raise KeyError(job_id)
+        if job.reset_epoch < epoch:
+          return {
+            "action": "already_reset",
+            "device_state": self._device_state,
+            "reset_epoch": epoch,
+            "hint": "Device was already reset after this job ran. Just resubmit your job.",
+          }
+      if self._device_state == "resetting" or self._reset_pending:
+        return {
+          "action": "joined",
+          "device_state": self._device_state,
+          "reset_epoch": epoch,
+          "hint": "A reset is already pending or in progress. Wait for it, then resubmit.",
+        }
+      self._reset_pending = True
+      self._cond.notify_all()
+      return {
+        "action": "scheduled",
+        "device_state": self._device_state,
+        "reset_epoch": epoch,
+        "hint": "Reset will run before the next job. Resubmit once the device is healthy.",
+      }
 
   def get_job(self, job_id: str) -> Job | None:
     job = self._jobs.get(job_id)
@@ -463,16 +653,30 @@ class DeviceQueue:
     return None
 
   def position_of(self, job_id: str) -> int:
-    """0-indexed position in the pending queue. -1 if not pending."""
+    """0-indexed position in the predicted dispatch order. -1 if not pending."""
     with self._lock:
       try:
-        return self._pending_ids.index(job_id)
+        return self._dispatch_order_locked().index(job_id)
       except ValueError:
         return -1
 
   def queue_length(self) -> int:
     with self._lock:
-      return len(self._pending_ids)
+      return sum(len(q) for q in self._pending.values())
+
+  def _device_status_locked(self) -> dict:
+    return {
+      "state": self._device_state,
+      "reset_epoch": self._reset_epoch,
+      "reset_pending": self._reset_pending,
+      "last_reset_at": _format_timestamp(self._last_reset_at),
+      "dead_since": _format_timestamp(self._dead_since),
+      "dead_reason": self._dead_reason,
+    }
+
+  def device_status(self) -> dict:
+    with self._lock:
+      return self._device_status_locked()
 
   def status(self) -> dict:
     with self._lock:
@@ -481,6 +685,7 @@ class DeviceQueue:
         j = self._current
         current = {
           "id": j.id, "cmd": j.cmd[:120],
+          "client": j.client_id,
           "running_sec": round(time.time() - (j.started_at or j.submitted), 1),
           "estimated_remaining_sec": self._estimated_remaining_locked(j),
           "repeat": j.repeat,
@@ -489,12 +694,14 @@ class DeviceQueue:
           "repeat_completed": j.repeat_completed,
         }
       pending = []
-      for index, jid in enumerate(self._pending_ids):
+      order = self._dispatch_order_locked()
+      for index, jid in enumerate(order):
         j = self._jobs[jid]
         pending.append({
           "id": j.id, "cmd": j.cmd[:120],
+          "client": j.client_id,
           "waiting_sec": round(time.time() - j.submitted, 1),
-          "estimated_wait_sec": self._estimate_wait_locked(self._pending_ids[:index], include_current=True),
+          "estimated_wait_sec": self._estimate_wait_locked(order[:index], include_current=True),
           "estimated_run_sec": self._estimated_remaining_locked(j),
           "repeat": j.repeat,
           "mode": j.mode,
@@ -503,6 +710,7 @@ class DeviceQueue:
         "current": current,
         "pending": pending,
         "recent": self._store.recent_completed(10),
+        "device": self._device_status_locked(),
       }
 
   def snapshot(self, job: Job) -> dict:
@@ -512,12 +720,13 @@ class DeviceQueue:
       running_sec = None
       estimated_remaining_sec = None
       if job.status == "queued":
+        order = self._dispatch_order_locked()
         try:
-          pos = self._pending_ids.index(job.id)
+          pos = order.index(job.id)
         except ValueError:
           pos = -1
         position = pos + 1
-        estimated_wait_sec = self._estimate_wait_locked(self._pending_ids[:max(pos, 0)], include_current=True)
+        estimated_wait_sec = self._estimate_wait_locked(order[:max(pos, 0)], include_current=True)
         estimated_remaining_sec = self._estimated_remaining_locked(job)
       elif job.status == "running":
         running_sec = round(time.time() - (job.started_at or job.submitted), 1)
@@ -530,6 +739,7 @@ class DeviceQueue:
       data = {
         "job_id": job.id,
         "status": job.status,
+        "client_id": job.client_id,
         "cmd": job.cmd,
         "cwd": job.cwd,
         "timeout": job.timeout,
@@ -754,18 +964,154 @@ class DeviceQueue:
       if should_kill:
         self._send_sigkill(proc)
 
+  def _next_work(self) -> tuple[str, Job | None]:
+    """Block until there is work. Returns ("reset", None) or ("job", job)."""
+    with self._cond:
+      while True:
+        if self._reset_pending and self._device_state != "dead":
+          self._reset_pending = False
+          self._device_state = "resetting"
+          return "reset", None
+        if self._device_state == "healthy":
+          job = self._pick_job_locked()
+          if job is not None:
+            job.status = "running"
+            job.started_at = time.time()
+            job.reset_epoch = self._reset_epoch
+            self._current = job
+            self._store.save_job(job)
+            return "job", job
+        self._cond.wait()
+
+  def _run_logged_command(self, job: Job, out_f, cmd: str, timeout: int) -> int:
+    """Run a health command (reset/probe), appending its output to the job log."""
+    self._append_output(job, out_f, f"[tt-device-queue] $ {cmd}\n".encode())
+    try:
+      proc = subprocess.run(
+        ["/bin/bash", "-lc", cmd],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=timeout, env=_job_env(),
+      )
+    except subprocess.TimeoutExpired as exc:
+      if exc.stdout:
+        self._append_output(job, out_f, exc.stdout)
+      self._append_output(
+        job, out_f,
+        f"[tt-device-queue] Command timed out after {timeout}s\n".encode(),
+      )
+      return -9
+    self._append_output(job, out_f, proc.stdout or b"")
+    if proc.returncode != 0:
+      self._append_output(
+        job, out_f, f"[tt-device-queue] exit {proc.returncode}\n".encode()
+      )
+    return proc.returncode
+
+  def _drain_pending(self, message: str):
+    """Fail every queued job with `message` appended to its log."""
+    with self._cond:
+      drained = [
+        self._jobs[jid]
+        for q in self._pending.values()
+        for jid in q
+      ]
+      self._pending.clear()
+      self._rr_clients.clear()
+      self._cond.notify_all()
+
+    for job in drained:
+      try:
+        with open(job.output_file, "ab") as f:
+          self._append_output(job, f, f"\n[tt-device-queue] {message}\n".encode())
+      except OSError:
+        pass
+      with self._cond:
+        job.status = "done"
+        job.exit_code = -1
+        job.finished_at = time.time()
+        self._store.save_job(job)
+
+  def _execute_reset(self):
+    """Run the reset + probe sequence. Transitions to healthy or dead."""
+    job_id = uuid.uuid4().hex[:8]
+    output_dir = LOG_DIR / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    job = Job(
+      id=job_id, cmd=f"[device reset] {RESET_CMD}", cwd="",
+      timeout=HEALTH_CMD_TIMEOUT, repeat=1, mode="reset", client_id="system",
+      output_file=str(output_dir / "output"),
+    )
+    job.status = "running"
+    job.started_at = time.time()
+    with self._lock:
+      self._jobs[job_id] = job
+      self._current = job
+      self._store.save_job(job)
+
+    print(f"[{job_id}] Device reset starting")
+    healthy = False
+    attempts = max(1, RESET_RETRIES + 1)
+    try:
+      with open(job.output_file, "wb") as out_f:
+        for attempt in range(1, attempts + 1):
+          self._append_output(
+            job, out_f,
+            f"[tt-device-queue] Reset attempt {attempt}/{attempts}\n".encode(),
+          )
+          self._run_logged_command(job, out_f, RESET_CMD, HEALTH_CMD_TIMEOUT)
+          probe_rc = self._run_logged_command(job, out_f, PROBE_CMD, HEALTH_CMD_TIMEOUT)
+          if probe_rc == 0:
+            healthy = True
+            break
+        if healthy:
+          self._append_output(
+            job, out_f, b"[tt-device-queue] Device healthy after reset\n"
+          )
+        else:
+          self._append_output(
+            job, out_f, f"\n[tt-device-queue] {REBOOT_REQUIRED_MSG}\n".encode()
+          )
+    except Exception as exc:
+      healthy = False
+      try:
+        with open(job.output_file, "ab") as out_f:
+          self._append_output(
+            job, out_f, f"\n[tt-device-queue] Reset error: {exc}\n".encode()
+          )
+      except OSError:
+        pass
+
+    now = time.time()
+    with self._cond:
+      job.status = "done"
+      job.exit_code = 0 if healthy else 1
+      job.finished_at = now
+      job.elapsed = round(now - (job.started_at or now), 2)
+      self._current = None
+      if healthy:
+        self._reset_epoch += 1
+        self._device_state = "healthy"
+        self._last_reset_at = now
+      else:
+        self._device_state = "dead"
+        self._dead_since = now
+        self._dead_reason = REBOOT_REQUIRED_MSG
+      self._store.save_job(job)
+      self._cond.notify_all()
+
+    if healthy:
+      print(f"[{job_id}] Device healthy after reset (epoch {self._reset_epoch})")
+    else:
+      print(f"[{job_id}] DEVICE DEAD — draining queue, reboot required")
+      self._drain_pending(REBOOT_REQUIRED_MSG)
+
   def worker_loop(self):
     """Runs forever in a dedicated thread. Processes jobs one at a time."""
     while True:
-      job = self._queue.get()
-
-      with self._lock:
-        job.status = "running"
-        job.started_at = time.time()
-        self._current = job
-        if job.id in self._pending_ids:
-          self._pending_ids.remove(job.id)
-        self._store.save_job(job)
+      kind, job = self._next_work()
+      if kind == "reset":
+        self._execute_reset()
+        continue
 
       print(f"[{job.id}] Running: {job.cmd[:100]}")
 
@@ -794,7 +1140,7 @@ class DeviceQueue:
               )
 
             proc = subprocess.Popen(
-              job.cmd, shell=True, executable="/bin/bash",
+              ["/bin/bash", "-lc", _job_shell_script(job.cmd)],
               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
               cwd=job.cwd or None,
               env=_job_env(job.env),
@@ -873,7 +1219,6 @@ class DeviceQueue:
 
       status = "OK" if exit_code == 0 else f"FAIL({exit_code})"
       print(f"[{job.id}] {status} in {elapsed}s -> {job.output_file}")
-      self._queue.task_done()
 
 
 dq = DeviceQueue(JobStore(DB_PATH))
@@ -963,12 +1308,12 @@ class Handler(BaseHTTPRequestHandler):
           "started_at": _format_timestamp(job.started_at),
         })
       else:
-        pos = dq.position_of(job_id)
+        pos, wait_sec = dq.queue_position(job_id)
         self._json_response(200, {
           "status": "queued",
           "mode": job.mode,
           "position": pos + 1,  # 1-indexed for humans
-          "estimated_wait_sec": dq.estimated_wait_for_position(pos),
+          "estimated_wait_sec": wait_sec,
           "estimated_remaining_sec": dq.estimated_remaining(job),
           "repeat": job.repeat,
           "repeat_current": job.repeat_current,
@@ -1010,6 +1355,41 @@ class Handler(BaseHTTPRequestHandler):
         self._json_response(200, {"error": "Nothing running"})
       return
 
+    if path == "/reset":
+      body = self._read_json_body()
+      if body is None:
+        return
+      job_id = (body.get("job_id") or "").strip() or None
+      try:
+        result = dq.request_reset(job_id)
+      except DeviceDeadError as exc:
+        self._json_response(503, {"error": str(exc), "device_state": "dead"})
+        return
+      except KeyError:
+        self._json_response(404, {"error": f"Unknown job: {job_id}"})
+        return
+      self._json_response(200, result)
+      return
+
+    if path == "/cancel":
+      body = self._read_json_body()
+      if body is None:
+        return
+      job_id = (body.get("job_id") or "").strip()
+      if not job_id:
+        self._json_response(400, {"error": "Missing 'job_id'"})
+        return
+      try:
+        cancelled = dq.cancel_job(job_id)
+      except KeyError:
+        self._json_response(404, {"error": f"Unknown job: {job_id}"})
+        return
+      except ValueError as exc:
+        self._json_response(409, {"error": str(exc)})
+        return
+      self._json_response(200, {"cancelled": cancelled})
+      return
+
     if path == "/queue":
       length = int(self.headers.get("Content-Length", 0))
       if length == 0:
@@ -1039,7 +1419,11 @@ class Handler(BaseHTTPRequestHandler):
           repeat=body.get("repeat", 1),
           mode=mode,
           env=body.get("env", {}),
+          client_id=body.get("client_id", DEFAULT_CLIENT_ID),
         )
+      except DeviceDeadError as exc:
+        self._json_response(503, {"error": str(exc), "device_state": "dead"})
+        return
       except ValueError as exc:
         self._json_response(400, {"error": str(exc)})
         return

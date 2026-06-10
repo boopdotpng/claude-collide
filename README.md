@@ -1,14 +1,14 @@
 # tt-device-queue
 
-FIFO job queue that serializes access to a shared resource (a GPU, a dev board, a serial port, etc.) so multiple AI agents — or humans — don't collide.
+Fair job queue that serializes access to a shared resource (a GPU, a dev board, a serial port, etc.) so multiple AI agents — or humans — don't collide. Scheduling is round-robin across agents (FIFO within each agent), so one agent with 50 queued jobs can't starve everyone else. The server also owns device health: resets are coalesced instead of stacking up, and an unrecoverable device fails everything with a clear reboot-required message.
 
 ## Why
 
-AI coding agents cannot use `flock` correctly. They forget the lock, release it early, hold it across unrelated work, or simply ignore it when told to use it. After enough wasted debugging sessions watching Claude trample its own device state, we gave up on teaching it and built a queue server instead. If the agent can only run commands by submitting them to a FIFO, it is physically impossible to collide.
+AI coding agents cannot use `flock` correctly. They forget the lock, release it early, hold it across unrelated work, or simply ignore it when told to use it. After enough wasted debugging sessions watching Claude trample its own device state, we gave up on teaching it and built a queue server instead. If the agent can only run commands by submitting them to a queue, it is physically impossible to collide.
 
 ## Components
 
-- **server.py** — HTTP server (localhost:5741) that runs a FIFO job queue. Commands execute one at a time via a single worker thread. Output is saved to `./logs/<job_id>/output` and mirrored into `./logs/jobs.sqlite3`.
+- **server.py** — HTTP server (localhost:5741) that runs the job queue. Commands execute one at a time via a single worker thread, scheduled round-robin across client ids. Output is saved to `./logs/<job_id>/output` and mirrored into `./logs/jobs.sqlite3`.
 - **mcp_server.py** — MCP (Model Context Protocol) server that wraps the HTTP API as native tools for AI coding agents. Runs over stdio.
 
 ## Architecture
@@ -18,7 +18,7 @@ AI coding agents cannot use `flock` correctly. They forget the lock, release it 
 │  AI Agent   │ ◄──────────────► │  mcp_server.py │ ──────────► │ server.py  │
 │  (claude,   │                  │                │             │ :5741      │
 │   codex,    │                  │  queue         │             │            │
-│   opencode) │                  │  result        │             │  FIFO      │──► shared
+│   opencode) │                  │  result        │             │  fair      │──► shared
 │             │                  │  status        │             │  worker    │    resource
 │             │                  │  tt_smi_status │             │            │
 └─────────────┘                  │  reset         │             └────────────┘
@@ -46,7 +46,8 @@ device.
 | `result(job_id)` | Yes | Wait for a job to finish, return full output |
 | `status()` | No | Show running, queued, and recent jobs |
 | `kill(job_id="")` | No | Stop the running job, sending Ctrl+C first and force-killing only if needed |
-| `reset()` | No | Queue a device reset command |
+| `cancel(job_id)` | No | Cancel one of your queued (not yet running) jobs |
+| `reset(job_id="")` | No | Report a broken device; the server coalesces resets and holds the queue while resetting |
 
 `repeat` defaults to `1`. When set higher, the server runs the same command sequentially inside a single queued job, appends all iterations into the same output file, and still returns one `job_id` for the agent to track. It stops immediately on the first failing iteration and exposes repeat progress through `job` and `status`. Initial ETA scales with `repeat`, then refines after the first successful iteration by reusing that iteration's runtime as the per-repeat estimate.
 
@@ -54,9 +55,21 @@ The server automatically prepends `.` to `PYTHONPATH` for queued jobs, so agents
 
 Use `queue_python` instead of large `python -c` strings or heredocs. The MCP wrapper writes the snippet into `logs/mcp-scripts/` and queues a short command that runs the generated file.
 
-`open_forever` is for Tenstorrent hardware commands that are intentionally meant to stay alive for a while, like device-facing profiler UIs or hardware log streams. It is not for ordinary local dev servers or CPU-only logs. These jobs still use the same FIFO queue and stdout file, but they keep the queue slot occupied until they exit or the agent calls `kill(job_id)`. Manual `kill` sends Ctrl+C first and only escalates to SIGKILL if the process ignores it; timeouts send SIGKILL immediately. The default timeout for `open_forever` jobs is 180 seconds.
+`open_forever` is for Tenstorrent hardware commands that are intentionally meant to stay alive for a while, like device-facing profiler UIs or hardware log streams. It is not for ordinary local dev servers or CPU-only logs. These jobs still use the same queue and stdout file, but they keep the queue slot occupied until they exit or the agent calls `kill(job_id)`. Manual `kill` sends Ctrl+C first and only escalates to SIGKILL if the process ignores it; timeouts send SIGKILL immediately. The default timeout for `open_forever` jobs is 180 seconds.
 
 Logs are persistent by default. The server stores compatibility output files in `./logs/<job_id>/output` and appends the same bytes to `./logs/jobs.sqlite3` as they are produced. Completed jobs remain available through `job`, `logs`, `result`, and `status` after the server restarts. The whole `./logs/` directory is ignored by git.
+
+## Fair scheduling across agents
+
+Each MCP server process generates a stable client id at startup (override with `TT_QUEUE_CLIENT_ID`; raw HTTP callers can pass `client_id` on `/queue`, otherwise they share the `anon` bucket). The scheduler keeps one FIFO subqueue per client and serves clients round-robin, so an agent that dumps 50 jobs into the queue waits its turn like everyone else, while each agent's own jobs still run in submission order. Queue positions and wait estimates reflect the simulated round-robin dispatch order.
+
+## Device health and resets
+
+`reset(job_id)` does not queue a reset command — it *reports* a broken device. The server coalesces reports using reset epochs: if the device was already reset since your failing job ran, you get `already_reset` (just resubmit); if a reset is pending or running, you get `joined`; otherwise one reset is `scheduled`. Twenty agents reporting the same breakage produce exactly one reset.
+
+The reset runs between jobs (the current job finishes first), then the device is verified with `tt-smi --snapshot`. While resetting, the queue is held. If the probe still fails after a retry, the device is declared **dead**: every queued job is failed with a `DEVICE UNRECOVERABLE … host reboot is required` message in its output (so agents blocked on `result` see it), new submissions get HTTP 503, and `status()` shows a dead-device banner. After the host reboots, the systemd service restart brings the queue back healthy.
+
+Reset/probe commands and retry count are configurable via `TT_DEVICE_RESET_CMD`, `TT_DEVICE_PROBE_CMD`, and `TT_DEVICE_RESET_RETRIES`.
 
 ## Setup
 

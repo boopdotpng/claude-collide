@@ -2,11 +2,13 @@ import json
 import os
 import shlex
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -21,7 +23,7 @@ def free_port() -> int:
     return sock.getsockname()[1]
 
 
-class QueueServerTest(unittest.TestCase):
+class QueueServerTestBase(unittest.TestCase):
   def setUp(self):
     self.temp_dir = tempfile.TemporaryDirectory()
     self.port = free_port()
@@ -29,7 +31,11 @@ class QueueServerTest(unittest.TestCase):
     self.server_env["TT_DEVICE_PORT"] = str(self.port)
     self.server_env["TT_DEVICE_LOG_DIR"] = self.temp_dir.name
     self.server_env.pop("PYTHONPATH", None)
+    self.server_env.update(self.extra_server_env())
     self._start_server()
+
+  def extra_server_env(self) -> dict:
+    return {}
 
   def _start_server(self):
     self.server = subprocess.Popen(
@@ -87,20 +93,38 @@ class QueueServerTest(unittest.TestCase):
     with urllib.request.urlopen(req, timeout=5) as resp:
       return json.loads(resp.read())
 
+  def post_status(self, path: str, payload: dict) -> tuple[int, dict]:
+    """POST that returns (status_code, body) instead of raising on HTTP errors."""
+    req = urllib.request.Request(
+      f"{self.base}{path}",
+      data=json.dumps(payload).encode(),
+      headers={"Content-Type": "application/json"},
+      method="POST",
+    )
+    try:
+      with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+      return exc.code, json.loads(exc.read())
+
   def submit(
       self,
       cmd: str,
       timeout: int = 5,
       repeat: int = 1,
       env: dict | None = None,
+      client: str | None = None,
   ) -> dict:
-    return self.post_json("/queue", {
+    payload = {
       "cmd": cmd,
       "cwd": str(REPO_ROOT),
       "timeout": timeout,
       "repeat": repeat,
       "env": env or {},
-    })
+    }
+    if client is not None:
+      payload["client_id"] = client
+    return self.post_json("/queue", payload)
 
   def submit_open(self, cmd: str, timeout: int = 5, env: dict | None = None) -> dict:
     return self.post_json("/queue", {
@@ -134,6 +158,30 @@ class QueueServerTest(unittest.TestCase):
   def python_cmd(self, code: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
 
+  def seq_cmd(self, name: str, seq_file: Path) -> str:
+    return f"/bin/sh -c {shlex.quote(f'echo {name} >> {seq_file}')}"
+
+  def wait_for_running(self, job_id: str, timeout: float = 5.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+      job = self.get_json(f"/job/{job_id}")
+      if job["status"] == "running":
+        return job
+      time.sleep(0.05)
+    raise AssertionError(f"job {job_id} did not start running in time")
+
+  def wait_for_device(self, state: str, epoch: int | None = None, timeout: float = 8.0) -> dict:
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+      last = self.get_json("/status")["device"]
+      if last["state"] == state and (epoch is None or last["reset_epoch"] == epoch):
+        return last
+      time.sleep(0.05)
+    raise AssertionError(f"device never reached {state} (epoch {epoch}): {last}")
+
+
+class QueueServerTest(QueueServerTestBase):
   def test_repeat_success_uses_one_job_and_one_output_file(self):
     submit = self.submit(self.python_cmd("print('ok')"), repeat=3)
     self.assertEqual(submit["repeat"], 3)
@@ -223,6 +271,43 @@ class QueueServerTest(unittest.TestCase):
 
     logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
     self.assertIn("1\n", logs["content"])
+
+  def test_shell_wrapper_preserves_compound_commands(self):
+    cmd = "printf 'one\\n'; TT_USB=2 " + self.python_cmd(
+      "import os; print(os.environ.get('TT_USB'))"
+    )
+    submit = self.submit(cmd, timeout=5)
+
+    result = self.wait_for_done(submit["job_id"])
+    self.assertEqual(result["exit_code"], 0)
+
+    logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
+    self.assertIn("one\n", logs["content"])
+    self.assertIn("2\n", logs["content"])
+
+  def test_queued_command_gets_default_child_oom_score(self):
+    code = "from pathlib import Path; print(Path('/proc/self/oom_score_adj').read_text().strip())"
+    submit = self.submit(self.python_cmd(code), timeout=5)
+
+    result = self.wait_for_done(submit["job_id"])
+    self.assertEqual(result["exit_code"], 0)
+
+    logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
+    self.assertIn("500\n", logs["content"])
+
+  def test_child_oom_score_can_be_overridden_per_job(self):
+    code = "from pathlib import Path; print(Path('/proc/self/oom_score_adj').read_text().strip())"
+    submit = self.submit(
+      self.python_cmd(code),
+      timeout=5,
+      env={"TT_DEVICE_CHILD_OOM_SCORE_ADJ": "250"},
+    )
+
+    result = self.wait_for_done(submit["job_id"])
+    self.assertEqual(result["exit_code"], 0)
+
+    logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
+    self.assertIn("250\n", logs["content"])
 
   def test_job_endpoint_reports_queue_running_and_done_metadata(self):
     first = self.submit("sleep 1", timeout=5)
@@ -422,6 +507,294 @@ class QueueServerTest(unittest.TestCase):
     logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
     self.assertIn("Timed out after 1s", logs["content"])
     self.assertIn("SIGKILL", logs["content"])
+
+  def test_round_robin_interleaves_clients(self):
+    seq = Path(self.temp_dir.name) / "seq.txt"
+    blocker = self.submit("sleep 1", client="agent-a")
+    self.wait_for_running(blocker["job_id"])
+
+    a1 = self.submit(self.seq_cmd("a1", seq), client="agent-a")
+    a2 = self.submit(self.seq_cmd("a2", seq), client="agent-a")
+    b1 = self.submit(self.seq_cmd("b1", seq), client="agent-b")
+
+    # b1 should slot in after a1 (round robin), not behind a1 and a2 (FIFO):
+    # ahead of it are the running blocker and a1 only.
+    self.assertEqual(b1["position"], 2)
+
+    for s in (a1, a2, b1):
+      self.wait_for_done(s["job_id"])
+    self.assertEqual(seq.read_text().split(), ["a1", "b1", "a2"])
+
+  def test_same_client_jobs_stay_fifo(self):
+    seq = Path(self.temp_dir.name) / "seq.txt"
+    blocker = self.submit("sleep 0.6", client="agent-a")
+    self.wait_for_running(blocker["job_id"])
+
+    submits = [
+      self.submit(self.seq_cmd(name, seq), client="agent-a")
+      for name in ("a1", "a2", "a3")
+    ]
+    for s in submits:
+      self.wait_for_done(s["job_id"])
+    self.assertEqual(seq.read_text().split(), ["a1", "a2", "a3"])
+
+  def test_client_id_defaults_to_anon_and_is_visible(self):
+    blocker = self.submit("sleep 0.6", client="agent-x")
+    self.wait_for_running(blocker["job_id"])
+    queued = self.submit(self.python_cmd("print('hi')"), client="agent-y")
+    anon = self.submit(self.python_cmd("print('anon')"))
+
+    job = self.get_json(f"/job/{queued['job_id']}")
+    self.assertEqual(job["client_id"], "agent-y")
+    self.assertEqual(self.get_json(f"/job/{anon['job_id']}")["client_id"], "anon")
+
+    status = self.get_json("/status")
+    self.assertEqual(status["current"]["client"], "agent-x")
+    clients = {p["id"]: p["client"] for p in status["pending"]}
+    self.assertEqual(clients[queued["job_id"]], "agent-y")
+    self.assertEqual(clients[anon["job_id"]], "anon")
+
+    self.wait_for_done(queued["job_id"])
+    self.wait_for_done(anon["job_id"])
+
+  def test_invalid_client_id_is_rejected(self):
+    code, resp = self.post_status("/queue", {
+      "cmd": "true", "cwd": "", "timeout": 5, "client_id": "   ",
+    })
+    self.assertEqual(code, 400)
+    self.assertIn("client_id", resp["error"])
+
+  def test_cancel_queued_job(self):
+    seq = Path(self.temp_dir.name) / "seq.txt"
+    blocker = self.submit("sleep 1")
+    self.wait_for_running(blocker["job_id"])
+    victim = self.submit(self.seq_cmd("victim", seq))
+
+    # Running jobs cannot be cancelled.
+    code, resp = self.post_status("/cancel", {"job_id": blocker["job_id"]})
+    self.assertEqual(code, 409)
+
+    # Unknown jobs 404.
+    code, resp = self.post_status("/cancel", {"job_id": "nope1234"})
+    self.assertEqual(code, 404)
+
+    code, resp = self.post_status("/cancel", {"job_id": victim["job_id"]})
+    self.assertEqual(code, 200)
+    self.assertEqual(resp["cancelled"]["id"], victim["job_id"])
+
+    result = self.wait_for_done(victim["job_id"])
+    self.assertEqual(result["exit_code"], -1)
+    logs = self.get_json(f"/logs/{victim['job_id']}?offset=0&limit=4096")
+    self.assertIn("Cancelled while queued", logs["content"])
+
+    self.wait_for_done(blocker["job_id"])
+    self.assertFalse(seq.exists(), "cancelled job must never run")
+
+  def test_status_reports_device_healthy(self):
+    device = self.get_json("/status")["device"]
+    self.assertEqual(device["state"], "healthy")
+    self.assertEqual(device["reset_epoch"], 0)
+    self.assertFalse(device["reset_pending"])
+
+  def test_migrates_legacy_db_without_client_columns(self):
+    self._stop_server()
+    db_path = Path(self.temp_dir.name) / "jobs.sqlite3"
+    for leftover in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+      leftover.unlink(missing_ok=True)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+      CREATE TABLE jobs (
+        id TEXT PRIMARY KEY, cmd TEXT NOT NULL, cwd TEXT NOT NULL,
+        timeout INTEGER NOT NULL, repeat INTEGER NOT NULL,
+        env_json TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL,
+        submitted REAL NOT NULL, started_at REAL, finished_at REAL,
+        exit_code INTEGER, elapsed REAL, output_file TEXT NOT NULL,
+        repeat_current INTEGER NOT NULL, repeat_completed INTEGER NOT NULL,
+        first_iteration_elapsed REAL, per_iter_estimate_sec REAL NOT NULL,
+        stop_requested_at REAL, stop_escalated_at REAL,
+        log_size INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL
+      )
+    """)
+    now = time.time()
+    conn.execute(
+      """
+      INSERT INTO jobs (
+        id, cmd, cwd, timeout, repeat, env_json, mode, status, submitted,
+        started_at, finished_at, exit_code, elapsed, output_file,
+        repeat_current, repeat_completed, first_iteration_elapsed,
+        per_iter_estimate_sec, stop_requested_at, stop_escalated_at,
+        log_size, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      """,
+      (
+        "legacy01", "echo legacy", "", 5, 1, "{}", "run", "done", now,
+        now, now, 0, 0.1, str(Path(self.temp_dir.name) / "legacy01" / "output"),
+        1, 1, 0.1, 0.1, None, None, 0, now,
+      ),
+    )
+    conn.commit()
+    conn.close()
+
+    self._start_server()
+
+    legacy = self.get_json("/job/legacy01")
+    self.assertEqual(legacy["status"], "done")
+    self.assertEqual(legacy["client_id"], "anon")
+
+    fresh = self.submit(self.python_cmd("print('post-migration')"), client="agent-z")
+    result = self.wait_for_done(fresh["job_id"])
+    self.assertEqual(result["exit_code"], 0)
+    self.assertEqual(self.get_json(f"/job/{fresh['job_id']}")["client_id"], "agent-z")
+
+
+class DeviceHealthTest(QueueServerTestBase):
+  def extra_server_env(self) -> dict:
+    base = Path(self.temp_dir.name)
+    self.reset_count = base / "reset_count"
+    self.reset_sleep = base / "reset_sleep"
+    self.probe_rc = base / "probe_rc"
+
+    reset_sh = base / "fake_reset.sh"
+    reset_sh.write_text(
+      "#!/bin/sh\n"
+      f"count=$(cat {self.reset_count} 2>/dev/null || echo 0)\n"
+      f"echo $((count + 1)) > {self.reset_count}\n"
+      f"sleep $(cat {self.reset_sleep} 2>/dev/null || echo 0)\n"
+      "echo reset-done\n"
+    )
+    probe_sh = base / "fake_probe.sh"
+    probe_sh.write_text(
+      "#!/bin/sh\n"
+      "echo probe\n"
+      f"exit $(cat {self.probe_rc} 2>/dev/null || echo 0)\n"
+    )
+    reset_sh.chmod(0o755)
+    probe_sh.chmod(0o755)
+
+    return {
+      "TT_DEVICE_RESET_CMD": str(reset_sh),
+      "TT_DEVICE_PROBE_CMD": str(probe_sh),
+      "TT_DEVICE_RESET_RETRIES": "0",
+    }
+
+  def reset_runs(self) -> int:
+    try:
+      return int(self.reset_count.read_text().strip())
+    except FileNotFoundError:
+      return 0
+
+  def test_concurrent_reset_requests_coalesce_into_one(self):
+    self.reset_sleep.write_text("1.0")
+    job = self.submit(self.python_cmd("print('boom')"))
+    self.wait_for_done(job["job_id"])
+
+    code, first = self.post_status("/reset", {"job_id": job["job_id"]})
+    self.assertEqual(code, 200)
+    self.assertEqual(first["action"], "scheduled")
+
+    # Everyone else piling on while the reset is pending/running just joins it.
+    for _ in range(5):
+      code, again = self.post_status("/reset", {"job_id": job["job_id"]})
+      self.assertEqual(code, 200)
+      self.assertEqual(again["action"], "joined")
+
+    self.wait_for_device("healthy", epoch=1)
+
+    # Stale report for a pre-reset job: no new reset.
+    code, stale = self.post_status("/reset", {"job_id": job["job_id"]})
+    self.assertEqual(code, 200)
+    self.assertEqual(stale["action"], "already_reset")
+
+    self.assertEqual(self.reset_runs(), 1)
+
+  def test_reset_for_unknown_job_is_404(self):
+    code, resp = self.post_status("/reset", {"job_id": "nope1234"})
+    self.assertEqual(code, 404)
+
+  def test_queue_is_held_during_reset_then_resumes(self):
+    self.reset_sleep.write_text("0.8")
+    job = self.submit(self.python_cmd("print('boom')"))
+    self.wait_for_done(job["job_id"])
+
+    code, resp = self.post_status("/reset", {"job_id": job["job_id"]})
+    self.assertEqual(resp["action"], "scheduled")
+
+    held = self.submit(self.python_cmd("print('after-reset')"))
+    time.sleep(0.3)
+    self.assertEqual(self.get_json(f"/job/{held['job_id']}")["status"], "queued")
+
+    result = self.wait_for_done(held["job_id"])
+    self.assertEqual(result["exit_code"], 0)
+    device = self.get_json("/status")["device"]
+    self.assertEqual(device["state"], "healthy")
+    self.assertEqual(device["reset_epoch"], 1)
+
+  def test_jobs_record_their_reset_epoch(self):
+    job = self.submit(self.python_cmd("print('one')"))
+    self.wait_for_done(job["job_id"])
+    self.post_status("/reset", {"job_id": job["job_id"]})
+    self.wait_for_device("healthy", epoch=1)
+
+    after = self.submit(self.python_cmd("print('two')"))
+    self.wait_for_done(after["job_id"])
+    # A job that ran after the reset is a fresh report: schedules a new reset.
+    code, resp = self.post_status("/reset", {"job_id": after["job_id"]})
+    self.assertEqual(resp["action"], "scheduled")
+    self.wait_for_device("healthy", epoch=2)
+
+  def test_failed_reset_marks_device_dead_drains_queue_and_blocks_submits(self):
+    self.probe_rc.write_text("1")
+
+    blocker = self.submit("sleep 0.6", client="agent-a")
+    self.wait_for_running(blocker["job_id"])
+    k1 = self.submit(self.python_cmd("print('k1')"), client="agent-a")
+    k2 = self.submit(self.python_cmd("print('k2')"), client="agent-b")
+
+    code, resp = self.post_status("/reset", {})
+    self.assertEqual(resp["action"], "scheduled")
+
+    # The running job is allowed to finish normally.
+    blocker_result = self.wait_for_done(blocker["job_id"])
+    self.assertEqual(blocker_result["exit_code"], 0)
+
+    # Queued jobs are drained with the reboot-required message.
+    for queued in (k1, k2):
+      result = self.wait_for_done(queued["job_id"])
+      self.assertEqual(result["exit_code"], -1)
+      logs = self.get_json(f"/logs/{queued['job_id']}?offset=0&limit=8192")
+      self.assertIn("reboot is required", logs["content"])
+
+    device = self.wait_for_device("dead")
+    self.assertIn("reboot", device["dead_reason"])
+
+    # New submissions are rejected with 503 + reboot message.
+    code, resp = self.post_status("/queue", {
+      "cmd": "true", "cwd": "", "timeout": 5,
+    })
+    self.assertEqual(code, 503)
+    self.assertIn("reboot", resp["error"])
+
+    # Further reset requests are also rejected.
+    code, resp = self.post_status("/reset", {})
+    self.assertEqual(code, 503)
+
+  def test_restart_recovers_from_dead_state(self):
+    self.probe_rc.write_text("1")
+    job = self.submit(self.python_cmd("print('boom')"))
+    self.wait_for_done(job["job_id"])
+    self.post_status("/reset", {"job_id": job["job_id"]})
+    self.wait_for_device("dead")
+
+    # Reboot (simulated by service restart) brings the queue back.
+    self._stop_server()
+    self._start_server()
+
+    device = self.get_json("/status")["device"]
+    self.assertEqual(device["state"], "healthy")
+    revived = self.submit(self.python_cmd("print('back')"))
+    result = self.wait_for_done(revived["job_id"])
+    self.assertEqual(result["exit_code"], 0)
 
 
 if __name__ == "__main__":
