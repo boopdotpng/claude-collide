@@ -36,9 +36,11 @@ Endpoints:
 import contextlib
 import json
 import os
+import re
 import resource
 import select
 import signal
+import shlex
 import sqlite3
 import subprocess
 import threading
@@ -78,10 +80,16 @@ HEALTH_CMD_TIMEOUT = int(os.environ.get("TT_DEVICE_HEALTH_CMD_TIMEOUT", "60"))
 # "mark dead, reboot required" path. Only ever runs from _execute_reset(),
 # i.e. never while a job is on the device.
 PCI_BDF = os.environ.get("TT_DEVICE_PCI_BDF", "0000:01:00.0")
-DEEP_RESET_CMD = os.environ.get(
-  "TT_DEVICE_DEEP_RESET_CMD",
-  f"sudo -n /usr/local/sbin/tt-pci-deep-reset {PCI_BDF}",
+DEEP_RESET_HELPER = os.environ.get(
+  "TT_DEVICE_DEEP_RESET_HELPER", "/usr/local/sbin/tt-pci-deep-reset"
 )
+DEEP_RESET_CMD = os.environ.get("TT_DEVICE_DEEP_RESET_CMD")
+DEEP_RESET_ARGV: list[str] | None = None
+if DEEP_RESET_CMD is None:
+  DEEP_RESET_ARGV = [
+    "sudo", "-n", DEEP_RESET_HELPER, "--queue-server-pid", str(os.getpid()), PCI_BDF,
+  ]
+  DEEP_RESET_CMD = " ".join(shlex.quote(part) for part in DEEP_RESET_ARGV)
 REBOOT_REQUIRED_MSG = (
   "DEVICE UNRECOVERABLE: neither a tt-smi reset nor a PCI remove/rescan "
   "brought the device back (tt-smi probe failing). A host reboot is "
@@ -91,6 +99,18 @@ REBOOT_REQUIRED_MSG = (
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+BLOCKED_JOB_COMMAND_PATTERNS = (
+  (
+    re.compile(r"(^|[\s;&|`$()])(?:/usr/local/sbin/)?tt-pci-deep-reset(?:\s|$)"),
+    "PCI deep-reset helper",
+  ),
+  (re.compile(r"/sys/bus/pci/rescan\b"), "PCI bus rescan"),
+  (
+    re.compile(r"/sys/bus/pci/devices/[^\s;&|<>]+/remove\b"),
+    "PCI device remove",
+  ),
+)
 
 
 def _job_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -111,6 +131,22 @@ def _job_shell_script(cmd: str) -> str:
     "}\" > /proc/$$/oom_score_adj 2>/dev/null || true",
     cmd,
   ])
+
+
+def _validate_job_command(cmd: str):
+  for pattern, label in BLOCKED_JOB_COMMAND_PATTERNS:
+    if pattern.search(cmd):
+      raise ValueError(
+        "Refusing to queue command that can reset PCI devices "
+        f"({label}). Use reset(job_id) to report a broken device; only "
+        "the queue server may run deep reset between jobs."
+      )
+
+
+def _command_display(cmd: str | list[str]) -> str:
+  if isinstance(cmd, str):
+    return cmd
+  return " ".join(shlex.quote(part) for part in cmd)
 
 
 def _format_timestamp(ts: float | None) -> str | None:
@@ -546,6 +582,7 @@ class DeviceQueue:
       client_id: str = DEFAULT_CLIENT_ID,
   ) -> tuple["Job", int, int]:
     """Submit a job. Returns (job, position, estimated_wait_sec) computed atomically."""
+    _validate_job_command(cmd)
     if repeat < 1:
       raise ValueError("repeat must be >= 1")
     if mode not in ("run", "open"):
@@ -1014,12 +1051,15 @@ class DeviceQueue:
             return "job", job
         self._cond.wait()
 
-  def _run_logged_command(self, job: Job, out_f, cmd: str, timeout: int) -> int:
+  def _run_logged_command(self, job: Job, out_f, cmd: str | list[str], timeout: int) -> int:
     """Run a health command (reset/probe), appending its output to the job log."""
-    self._append_output(job, out_f, f"[tt-device-queue] $ {cmd}\n".encode())
+    self._append_output(
+      job, out_f, f"[tt-device-queue] $ {_command_display(cmd)}\n".encode()
+    )
+    argv = ["/bin/bash", "-lc", cmd] if isinstance(cmd, str) else cmd
     try:
       proc = subprocess.run(
-        ["/bin/bash", "-lc", cmd],
+        argv,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         timeout=timeout, env=_job_env(),
       )
@@ -1104,7 +1144,7 @@ class DeviceQueue:
             b"remove/rescan\n",
           )
           deep_rc = self._run_logged_command(
-            job, out_f, DEEP_RESET_CMD, HEALTH_CMD_TIMEOUT
+            job, out_f, DEEP_RESET_ARGV or DEEP_RESET_CMD, HEALTH_CMD_TIMEOUT
           )
           if deep_rc == 0:
             self._run_logged_command(job, out_f, RESET_CMD, HEALTH_CMD_TIMEOUT)

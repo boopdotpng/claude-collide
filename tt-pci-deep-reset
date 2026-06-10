@@ -5,18 +5,115 @@
 # /etc/sudoers.d/tt-device-queue so the (user-level) tt-device-queue service
 # can escalate when a tt-smi -r level reset does not bring the device back.
 #
-# Usage: tt-pci-deep-reset [BDF]   (default: 0000:01:00.0)
+# Usage: tt-pci-deep-reset --queue-server-pid PID [BDF]
+#        tt-pci-deep-reset [BDF]   # direct root use only
 #
 # Only ever touches /sys/bus/pci/devices/<BDF>/remove and /sys/bus/pci/rescan;
 # the BDF argument is strictly validated so this cannot be abused to write
 # anywhere else.
 set -euo pipefail
 
-BDF="${1:-0000:01:00.0}"
+usage() {
+  cat <<'EOF'
+Usage: tt-pci-deep-reset --queue-server-pid PID [BDF]
+
+PCI remove + rescan for a wedged Tenstorrent device. When invoked through
+sudo, this helper only accepts calls made directly by the tt-device-queue
+server's reset worker. Use the queue's reset(job_id) tool instead of running
+this manually from an agent shell.
+EOF
+}
+
+proc_ppid() {
+  local pid="$1"
+  sed -E 's/.*\) [^ ]+ ([0-9]+).*/\1/' "/proc/$pid/stat"
+}
+
+require_queue_server_parent() {
+  local server_pid="$1"
+  local sudo_parent=""
+  local cmdline=""
+
+  if [ -z "${SUDO_USER:-}" ]; then
+    return
+  fi
+  if [ -z "$server_pid" ]; then
+    echo "tt-pci-deep-reset: sudo use is restricted to tt-device-queue reset worker" >&2
+    echo "tt-pci-deep-reset: use reset(job_id), not direct sudo" >&2
+    exit 3
+  fi
+  if ! [[ "$server_pid" =~ ^[0-9]+$ ]] || [ ! -r "/proc/$server_pid/stat" ]; then
+    echo "tt-pci-deep-reset: invalid queue server pid: $server_pid" >&2
+    exit 3
+  fi
+
+  sudo_parent="$(proc_ppid "$PPID" 2>/dev/null || true)"
+  if [ "$sudo_parent" != "$server_pid" ]; then
+    echo "tt-pci-deep-reset: refused; sudo caller is not the queue server" >&2
+    echo "tt-pci-deep-reset: use reset(job_id) so the queue can run resets between jobs" >&2
+    exit 3
+  fi
+
+  cmdline="$(tr '\0' ' ' < "/proc/$server_pid/cmdline" 2>/dev/null || true)"
+  case "$cmdline" in
+    *server.py*) ;;
+    *)
+      echo "tt-pci-deep-reset: refused; parent is not tt-device-queue server.py" >&2
+      exit 3
+      ;;
+  esac
+}
+
+QUEUE_SERVER_PID=""
+BDF=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --queue-server-pid)
+      if [ "$#" -lt 2 ]; then
+        echo "tt-pci-deep-reset: --queue-server-pid requires a value" >&2
+        exit 2
+      fi
+      QUEUE_SERVER_PID="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "tt-pci-deep-reset: unknown option: $1" >&2
+      exit 2
+      ;;
+    *)
+      if [ -n "$BDF" ]; then
+        echo "tt-pci-deep-reset: too many PCI addresses" >&2
+        exit 2
+      fi
+      BDF="$1"
+      shift
+      ;;
+  esac
+done
+
+if [ "$#" -gt 0 ]; then
+  if [ -n "$BDF" ] || [ "$#" -gt 1 ]; then
+    echo "tt-pci-deep-reset: too many PCI addresses" >&2
+    exit 2
+  fi
+  BDF="$1"
+fi
+
+BDF="${BDF:-0000:01:00.0}"
 if ! [[ "$BDF" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]]; then
   echo "tt-pci-deep-reset: invalid PCI address: $BDF" >&2
   exit 2
 fi
+
+require_queue_server_parent "$QUEUE_SERVER_PID"
 
 DEV="/sys/bus/pci/devices/$BDF"
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVER_PATH = REPO_ROOT / "server.py"
+DEEP_RESET_HELPER = REPO_ROOT / "tt-pci-deep-reset"
 
 
 def free_port() -> int:
@@ -179,6 +180,33 @@ class QueueServerTestBase(unittest.TestCase):
         return last
       time.sleep(0.05)
     raise AssertionError(f"device never reached {state} (epoch {epoch}): {last}")
+
+
+class DeepResetHelperTest(unittest.TestCase):
+  def test_help_does_not_attempt_reset(self):
+    proc = subprocess.run(
+      [str(DEEP_RESET_HELPER), "--help"],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      text=True,
+      check=False,
+    )
+    self.assertEqual(proc.returncode, 0)
+    self.assertIn("--queue-server-pid", proc.stdout)
+
+  def test_sudo_invocation_requires_queue_server_parent(self):
+    env = os.environ.copy()
+    env["SUDO_USER"] = "agent"
+    proc = subprocess.run(
+      [str(DEEP_RESET_HELPER), "0000:01:00.0"],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      text=True,
+      env=env,
+      check=False,
+    )
+    self.assertEqual(proc.returncode, 3)
+    self.assertIn("use reset(job_id)", proc.stdout)
 
 
 class QueueServerTest(QueueServerTestBase):
@@ -563,6 +591,17 @@ class QueueServerTest(QueueServerTestBase):
     })
     self.assertEqual(code, 400)
     self.assertIn("client_id", resp["error"])
+
+  def test_pci_reset_commands_are_rejected(self):
+    for cmd in (
+        "sudo -n /usr/local/sbin/tt-pci-deep-reset",
+        "echo 1 > /sys/bus/pci/rescan",
+        "echo 1 > /sys/bus/pci/devices/0000:01:00.0/remove",
+    ):
+      with self.subTest(cmd=cmd):
+        code, resp = self.post_status("/queue", {"cmd": cmd})
+        self.assertEqual(code, 400)
+        self.assertIn("Refusing to queue command", resp["error"])
 
   def test_cancel_queued_job(self):
     seq = Path(self.temp_dir.name) / "seq.txt"

@@ -2,8 +2,10 @@
 # Installs the privileged deep-reset helper used by tt-device-queue.
 #
 # This is the ONLY root-level access the service gets: a single fixed-path
-# script that does a PCI remove + rescan of the Tenstorrent device. The
-# sudoers rule is scoped to exactly that path, NOPASSWD, nothing else.
+# script that does a PCI remove + rescan of the Tenstorrent device. The helper
+# itself refuses sudo calls unless they come directly from the queue server's
+# reset worker; agent shells should report breakage via reset(job_id) instead.
+# The sudoers rule is scoped to exactly that path, NOPASSWD, nothing else.
 #
 # Run manually:  sudo ./install-deep-reset.sh
 set -euo pipefail
@@ -38,7 +40,8 @@ install -o root -g root -m 0440 "$TMP" "$SUDOERS_DST"
 
 echo ""
 echo "Done. Verify as $SERVICE_USER with:"
-echo "  sudo -n $HELPER_DST --help 2>&1 | head -1   # should NOT ask for a password"
+echo "  sudo -n $HELPER_DST --help 2>&1 | head -1       # should NOT ask for a password"
+echo "  sudo -n $HELPER_DST 2>&1 | head -1              # should be refused outside the queue"
 echo ""
 echo "The queue server picks this up automatically (no config needed) the next"
 echo "time the service restarts. It is only used as an escalation when the"

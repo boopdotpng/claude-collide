@@ -306,6 +306,8 @@ MCP behavior notes:
 - `tt_smi_status` does not use the queue and can run concurrently with queued jobs.
 - `reset` is not queued work and not a direct bypass path; it is a health
   report handled by the server's device state machine.
+- The deep-reset sudo helper refuses direct agent-shell invocation; it only
+  accepts sudo calls spawned directly by the queue server reset worker.
 
 ## Shared Client Layer
 
