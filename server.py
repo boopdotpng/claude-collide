@@ -71,10 +71,22 @@ RESET_CMD = os.environ.get("TT_DEVICE_RESET_CMD", f"{TT_SMI_PATH} -r 0")
 PROBE_CMD = os.environ.get("TT_DEVICE_PROBE_CMD", f"{TT_SMI_PATH} --snapshot")
 RESET_RETRIES = int(os.environ.get("TT_DEVICE_RESET_RETRIES", "1"))
 HEALTH_CMD_TIMEOUT = int(os.environ.get("TT_DEVICE_HEALTH_CMD_TIMEOUT", "60"))
+# Escalation when tt-smi -r fails its probe: PCI remove + rescan via a
+# root-owned helper allowed through /etc/sudoers.d/tt-device-queue (see
+# install-deep-reset.sh). `sudo -n` fails fast (no password prompt) if the
+# helper is not installed, in which case behaviour degrades to the old
+# "mark dead, reboot required" path. Only ever runs from _execute_reset(),
+# i.e. never while a job is on the device.
+PCI_BDF = os.environ.get("TT_DEVICE_PCI_BDF", "0000:01:00.0")
+DEEP_RESET_CMD = os.environ.get(
+  "TT_DEVICE_DEEP_RESET_CMD",
+  f"sudo -n /usr/local/sbin/tt-pci-deep-reset {PCI_BDF}",
+)
 REBOOT_REQUIRED_MSG = (
-  "DEVICE UNRECOVERABLE: reset did not bring the device back (tt-smi probe "
-  "failing). A host reboot is required. All queued jobs were aborted — end "
-  "your turn and do not submit further jobs."
+  "DEVICE UNRECOVERABLE: neither a tt-smi reset nor a PCI remove/rescan "
+  "brought the device back (tt-smi probe failing). A host reboot is "
+  "required. All queued jobs were aborted — end your turn and do not "
+  "submit further jobs."
 )
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1082,6 +1094,25 @@ class DeviceQueue:
           if probe_rc == 0:
             healthy = True
             break
+        if not healthy:
+          # Escalate: PCI remove + rescan (deeper than tt-smi -r), then one
+          # more tt-smi reset + probe. The worker thread is the only thing
+          # that calls this, so no job can be running on the device here.
+          self._append_output(
+            job, out_f,
+            b"[tt-device-queue] tt-smi reset failed; escalating to PCI "
+            b"remove/rescan\n",
+          )
+          deep_rc = self._run_logged_command(
+            job, out_f, DEEP_RESET_CMD, HEALTH_CMD_TIMEOUT
+          )
+          if deep_rc == 0:
+            self._run_logged_command(job, out_f, RESET_CMD, HEALTH_CMD_TIMEOUT)
+            probe_rc = self._run_logged_command(
+              job, out_f, PROBE_CMD, HEALTH_CMD_TIMEOUT
+            )
+            if probe_rc == 0:
+              healthy = True
         if healthy:
           self._append_output(
             job, out_f, b"[tt-device-queue] Device healthy after reset\n"

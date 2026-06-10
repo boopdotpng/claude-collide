@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# tt-pci-deep-reset — PCI remove + rescan for a wedged Tenstorrent device.
+#
+# Installed root-owned at /usr/local/sbin/tt-pci-deep-reset and allowed via
+# /etc/sudoers.d/tt-device-queue so the (user-level) tt-device-queue service
+# can escalate when a tt-smi -r level reset does not bring the device back.
+#
+# Usage: tt-pci-deep-reset [BDF]   (default: 0000:01:00.0)
+#
+# Only ever touches /sys/bus/pci/devices/<BDF>/remove and /sys/bus/pci/rescan;
+# the BDF argument is strictly validated so this cannot be abused to write
+# anywhere else.
+set -euo pipefail
+
+BDF="${1:-0000:01:00.0}"
+if ! [[ "$BDF" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]]; then
+  echo "tt-pci-deep-reset: invalid PCI address: $BDF" >&2
+  exit 2
+fi
+
+DEV="/sys/bus/pci/devices/$BDF"
+
+if [ -e "$DEV/remove" ]; then
+  echo "tt-pci-deep-reset: removing $BDF from the PCI bus"
+  echo 1 > "$DEV/remove"
+else
+  echo "tt-pci-deep-reset: $BDF not present (already removed or fell off the bus)"
+fi
+
+sleep 1
+
+echo "tt-pci-deep-reset: rescanning PCI bus"
+echo 1 > /sys/bus/pci/rescan
+
+# Give the kernel + tenstorrent driver a moment to re-probe.
+sleep 2
+
+if [ -e "$DEV" ]; then
+  echo "tt-pci-deep-reset: $BDF re-enumerated"
+  lspci -s "${BDF#0000:}" -vv 2>/dev/null | grep -E 'Region|LnkSta|Command' || true
+  exit 0
+fi
+
+echo "tt-pci-deep-reset: $BDF did NOT come back after rescan" >&2
+exit 1

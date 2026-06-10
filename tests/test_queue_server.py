@@ -669,18 +669,40 @@ class DeviceHealthTest(QueueServerTestBase):
       "echo probe\n"
       f"exit $(cat {self.probe_rc} 2>/dev/null || echo 0)\n"
     )
+    # Fake deep reset (PCI remove/rescan stand-in): on success it "fixes" the
+    # device by clearing probe_rc; deep_rc simulates the helper failing.
+    self.deep_count = base / "deep_count"
+    self.deep_rc = base / "deep_rc"
+    deep_sh = base / "fake_deep_reset.sh"
+    deep_sh.write_text(
+      "#!/bin/sh\n"
+      f"count=$(cat {self.deep_count} 2>/dev/null || echo 0)\n"
+      f"echo $((count + 1)) > {self.deep_count}\n"
+      f"rc=$(cat {self.deep_rc} 2>/dev/null || echo 0)\n"
+      "[ \"$rc\" -ne 0 ] && exit \"$rc\"\n"
+      f"echo 0 > {self.probe_rc}\n"
+      "echo deep-reset-done\n"
+    )
     reset_sh.chmod(0o755)
     probe_sh.chmod(0o755)
+    deep_sh.chmod(0o755)
 
     return {
       "TT_DEVICE_RESET_CMD": str(reset_sh),
       "TT_DEVICE_PROBE_CMD": str(probe_sh),
+      "TT_DEVICE_DEEP_RESET_CMD": str(deep_sh),
       "TT_DEVICE_RESET_RETRIES": "0",
     }
 
   def reset_runs(self) -> int:
     try:
       return int(self.reset_count.read_text().strip())
+    except FileNotFoundError:
+      return 0
+
+  def deep_reset_runs(self) -> int:
+    try:
+      return int(self.deep_count.read_text().strip())
     except FileNotFoundError:
       return 0
 
@@ -743,8 +765,27 @@ class DeviceHealthTest(QueueServerTestBase):
     self.assertEqual(resp["action"], "scheduled")
     self.wait_for_device("healthy", epoch=2)
 
+  def test_deep_reset_recovers_device_when_tt_smi_reset_fails(self):
+    # Probe keeps failing until the deep reset (PCI remove/rescan) "fixes" it.
+    self.probe_rc.write_text("1")
+    job = self.submit(self.python_cmd("print('boom')"))
+    self.wait_for_done(job["job_id"])
+
+    code, resp = self.post_status("/reset", {"job_id": job["job_id"]})
+    self.assertEqual(resp["action"], "scheduled")
+
+    device = self.wait_for_device("healthy", epoch=1)
+    self.assertEqual(self.deep_reset_runs(), 1)
+    # tt-smi reset ran once before escalation and once after the deep reset.
+    self.assertEqual(self.reset_runs(), 2)
+
+    after = self.submit(self.python_cmd("print('recovered')"))
+    result = self.wait_for_done(after["job_id"])
+    self.assertEqual(result["exit_code"], 0)
+
   def test_failed_reset_marks_device_dead_drains_queue_and_blocks_submits(self):
     self.probe_rc.write_text("1")
+    self.deep_rc.write_text("1")  # deep reset escalation fails too
 
     blocker = self.submit("sleep 0.6", client="agent-a")
     self.wait_for_running(blocker["job_id"])
@@ -781,6 +822,7 @@ class DeviceHealthTest(QueueServerTestBase):
 
   def test_restart_recovers_from_dead_state(self):
     self.probe_rc.write_text("1")
+    self.deep_rc.write_text("1")  # deep reset escalation fails too
     job = self.submit(self.python_cmd("print('boom')"))
     self.wait_for_done(job["job_id"])
     self.post_status("/reset", {"job_id": job["job_id"]})

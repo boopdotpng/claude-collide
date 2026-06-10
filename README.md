@@ -67,9 +67,11 @@ Each MCP server process generates a stable client id at startup (override with `
 
 `reset(job_id)` does not queue a reset command — it *reports* a broken device. The server coalesces reports using reset epochs: if the device was already reset since your failing job ran, you get `already_reset` (just resubmit); if a reset is pending or running, you get `joined`; otherwise one reset is `scheduled`. Twenty agents reporting the same breakage produce exactly one reset.
 
-The reset runs between jobs (the current job finishes first), then the device is verified with `tt-smi --snapshot`. While resetting, the queue is held. If the probe still fails after a retry, the device is declared **dead**: every queued job is failed with a `DEVICE UNRECOVERABLE … host reboot is required` message in its output (so agents blocked on `result` see it), new submissions get HTTP 503, and `status()` shows a dead-device banner. After the host reboots, the systemd service restart brings the queue back healthy.
+The reset runs between jobs (the current job finishes first), then the device is verified with `tt-smi --snapshot`. While resetting, the queue is held. If the probe still fails after a retry, the server escalates to a **deep reset**: a PCI remove + rescan (`echo 1 > /sys/bus/pci/devices/<BDF>/remove`, then `echo 1 > /sys/bus/pci/rescan`) via a root-owned helper, followed by one more `tt-smi -r` + probe. This recovers devices that have fallen off the bus, where a tt-smi-level reset can't reach them. Only if that also fails is the device declared **dead**: every queued job is failed with a `DEVICE UNRECOVERABLE … host reboot is required` message in its output (so agents blocked on `result` see it), new submissions get HTTP 503, and `status()` shows a dead-device banner. After the host reboots, the systemd service restart brings the queue back healthy.
 
-Reset/probe commands and retry count are configurable via `TT_DEVICE_RESET_CMD`, `TT_DEVICE_PROBE_CMD`, and `TT_DEVICE_RESET_RETRIES`.
+The deep reset needs root, but the service runs as your user — so it goes through `sudo -n /usr/local/sbin/tt-pci-deep-reset`, a fixed-path helper allowed by a single-line `/etc/sudoers.d/tt-device-queue` rule (no blanket sudo for the service). Install it once with `sudo ./install-deep-reset.sh`. Until it's installed, `sudo -n` fails fast and behavior degrades to the old mark-dead path. Like the first-level reset, the deep reset only ever runs from the worker thread between jobs — never while a job is on the device.
+
+Reset/probe commands and retry count are configurable via `TT_DEVICE_RESET_CMD`, `TT_DEVICE_PROBE_CMD`, and `TT_DEVICE_RESET_RETRIES`; the escalation via `TT_DEVICE_PCI_BDF` (default `0000:01:00.0`) and `TT_DEVICE_DEEP_RESET_CMD`.
 
 ## Setup
 
