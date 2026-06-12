@@ -188,6 +188,24 @@ class Job:
   log_size: int = 0
 
 
+def _job_ref(job: Job | None) -> dict | None:
+  if job is None:
+    return None
+  return {
+    "id": job.id,
+    "cmd": job.cmd,
+    "cwd": job.cwd,
+    "client": job.client_id,
+    "mode": job.mode,
+    "status": job.status,
+    "exit_code": job.exit_code,
+    "output_file": job.output_file,
+    "submitted_at": _format_timestamp(job.submitted),
+    "started_at": _format_timestamp(job.started_at),
+    "finished_at": _format_timestamp(job.finished_at),
+  }
+
+
 class JobStore:
   def __init__(self, db_path: Path):
     self.db_path = db_path
@@ -390,6 +408,20 @@ class JobStore:
       ).fetchall()
     return [self._history_row(row) for row in reversed(rows)]
 
+  def latest_completed_device_job(self) -> Job | None:
+    with self._connect() as conn:
+      row = conn.execute(
+        """
+        SELECT * FROM jobs
+        WHERE status = 'done' AND mode != 'reset'
+        ORDER BY finished_at DESC, submitted DESC
+        LIMIT 1
+        """
+      ).fetchone()
+    if row is None:
+      return None
+    return self._row_to_job(row)
+
   def read_logs(self, job_id: str, offset: int, limit: int) -> tuple[bytes, int, bool]:
     with self._connect() as conn:
       row = conn.execute(
@@ -489,6 +521,7 @@ class DeviceQueue:
     self._last_reset_at: float | None = None
     self._dead_since: float | None = None
     self._dead_reason: str | None = None
+    self._last_breakage: dict | None = None
 
   def _dispatch_order_locked(self) -> list[str]:
     """Simulate the round-robin scheduler over current subqueues.
@@ -670,15 +703,56 @@ class DeviceQueue:
       self._store.save_job(job)
     return {"id": job.id, "cmd": job.cmd[:120], "client": job.client_id}
 
-  def request_reset(self, job_id: str | None = None) -> dict:
+  def _suspected_breakage_job_locked(self, reported_job: Job | None) -> Job | None:
+    if reported_job is not None and reported_job.mode != "reset":
+      return reported_job
+    if self._current is not None and self._current.mode != "reset":
+      return self._current
+    latest = self._store.latest_completed_device_job()
+    if latest is not None:
+      cached = self._jobs.get(latest.id)
+      if cached is not None:
+        return cached
+    return latest
+
+  def _record_breakage_report_locked(
+      self,
+      *,
+      job: Job | None,
+      client_id: str,
+      action: str,
+  ) -> dict:
+    now = time.time()
+    suspect = self._suspected_breakage_job_locked(job)
+    report = {
+      "reported_at": _format_timestamp(now),
+      "reported_by": client_id,
+      "reset_epoch": self._reset_epoch,
+      "action": action,
+      "reported_job": _job_ref(job),
+      "suspect_job": _job_ref(suspect),
+    }
+    self._last_breakage = report
+    return report
+
+  def request_reset(
+      self,
+      job_id: str | None = None,
+      client_id: str = DEFAULT_CLIENT_ID,
+  ) -> dict:
     """Request a device reset, coalescing duplicates via reset epochs.
 
     Raises DeviceDeadError when the device is dead and KeyError for unknown jobs.
     """
+    if not isinstance(client_id, str) or not client_id.strip():
+      client_id = DEFAULT_CLIENT_ID
+    client_id = client_id.strip()[:MAX_CLIENT_ID_LEN]
+
     with self._cond:
       if self._device_state == "dead":
         raise DeviceDeadError(self._dead_reason or REBOOT_REQUIRED_MSG)
       epoch = self._reset_epoch
+      job = None
       if job_id:
         job = self._jobs.get(job_id) or self._store.load_job(job_id)
         if job is None:
@@ -691,18 +765,30 @@ class DeviceQueue:
             "hint": "Device was already reset after this job ran. Just resubmit your job.",
           }
       if self._device_state == "resetting" or self._reset_pending:
+        breakage = self._last_breakage
+        if breakage is None or (
+            breakage.get("suspect_job") is None and job is not None
+        ):
+          breakage = self._record_breakage_report_locked(
+            job=job, client_id=client_id, action="joined"
+          )
         return {
           "action": "joined",
           "device_state": self._device_state,
           "reset_epoch": epoch,
+          "breakage": breakage,
           "hint": "A reset is already pending or in progress. Wait for it, then resubmit.",
         }
       self._reset_pending = True
+      breakage = self._record_breakage_report_locked(
+        job=job, client_id=client_id, action="scheduled"
+      )
       self._cond.notify_all()
       return {
         "action": "scheduled",
         "device_state": self._device_state,
         "reset_epoch": epoch,
+        "breakage": breakage,
         "hint": "Reset will run before the next job. Resubmit once the device is healthy.",
       }
 
@@ -736,6 +822,7 @@ class DeviceQueue:
       "last_reset_at": _format_timestamp(self._last_reset_at),
       "dead_since": _format_timestamp(self._dead_since),
       "dead_reason": self._dead_reason,
+      "last_breakage": self._last_breakage,
     }
 
   def device_status(self) -> dict:
@@ -1117,6 +1204,8 @@ class DeviceQueue:
     with self._lock:
       self._jobs[job_id] = job
       self._current = job
+      if self._last_breakage is not None:
+        self._last_breakage["reset_job"] = _job_ref(job)
       self._store.save_job(job)
 
     print(f"[{job_id}] Device reset starting")
@@ -1186,6 +1275,10 @@ class DeviceQueue:
         self._device_state = "dead"
         self._dead_since = now
         self._dead_reason = REBOOT_REQUIRED_MSG
+      if self._last_breakage is not None:
+        self._last_breakage["reset_job"] = _job_ref(job)
+        self._last_breakage["reset_finished_at"] = _format_timestamp(now)
+        self._last_breakage["reset_result"] = "healthy" if healthy else "dead"
       self._store.save_job(job)
       self._cond.notify_all()
 
@@ -1347,6 +1440,10 @@ class Handler(BaseHTTPRequestHandler):
       self._json_response(200, dq.status())
       return
 
+    if path == "/breakage":
+      self._json_response(200, {"last_breakage": dq.device_status().get("last_breakage")})
+      return
+
     if path.startswith("/job/"):
       job_id = path[len("/job/"):]
       job = dq.get_job(job_id)
@@ -1461,8 +1558,9 @@ class Handler(BaseHTTPRequestHandler):
       if body is None:
         return
       job_id = (body.get("job_id") or "").strip() or None
+      client_id = body.get("client_id", DEFAULT_CLIENT_ID)
       try:
-        result = dq.request_reset(job_id)
+        result = dq.request_reset(job_id, client_id=client_id)
       except DeviceDeadError as exc:
         self._json_response(503, {"error": str(exc), "device_state": "dead"})
         return

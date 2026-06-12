@@ -143,6 +143,19 @@ class McpStatusBannerTest(unittest.IsolatedAsyncioTestCase):
         "reset_pending": False,
         "dead_since": "2026-06-09 14:32:00",
         "dead_reason": "DEVICE UNRECOVERABLE: reboot required",
+        "last_breakage": {
+          "reported_at": "2026-06-09 14:31:55",
+          "reported_by": "agent-a",
+          "suspect_job": {
+            "id": "badjob1",
+            "cmd": "python bad.py",
+            "client": "agent-a",
+            "output_file": "/tmp/badjob1/output",
+          },
+          "reported_job": None,
+          "reset_job": {"id": "reset01", "mode": "reset"},
+          "reset_result": "dead",
+        },
       },
     }
 
@@ -151,6 +164,8 @@ class McpStatusBannerTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertIn("DEVICE DEAD", response)
     self.assertIn("reboot required", response)
+    self.assertIn("suspect [badjob1]", response)
+    self.assertIn("/tmp/badjob1/output", response)
 
   async def test_status_shows_resetting_banner_and_clients(self):
     status_payload = {
@@ -172,6 +187,20 @@ class McpStatusBannerTest(unittest.IsolatedAsyncioTestCase):
     self.assertIn("DEVICE RESET in progress", response)
     self.assertIn("(agent-a)", response)
     self.assertIn("(agent-b)", response)
+
+  async def test_last_breakage_fetches_direct_record(self):
+    payload = {
+      "last_breakage": {
+        "reported_by": "agent-a",
+        "suspect_job": {"id": "badjob1", "cmd": "python bad.py"},
+      },
+    }
+
+    with patch("mcp_server._get", new=AsyncMock(return_value=payload)) as mock_get:
+      response = await mcp_server.last_breakage()
+
+    self.assertEqual(json.loads(response), payload)
+    mock_get.assert_awaited_once_with("/breakage")
 
 
 if __name__ == "__main__":

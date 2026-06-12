@@ -161,6 +161,31 @@ async def tt_smi_status() -> str:
     return await asyncio.to_thread(run_tt_smi_snapshot)
 
 
+def _breakage_lines(breakage: dict | None) -> list[str]:
+    if not breakage:
+        return []
+    lines = ["LAST BREAKAGE REPORT:"]
+    suspect = breakage.get("suspect_job") or {}
+    if suspect:
+        lines.append(
+            f"  suspect [{suspect.get('id')}] ({suspect.get('client')}) {suspect.get('cmd')}"
+        )
+        if suspect.get("output_file"):
+            lines.append(f"  output {suspect['output_file']}")
+    reported_job = breakage.get("reported_job") or {}
+    if reported_job and reported_job.get("id") != suspect.get("id"):
+        lines.append(f"  reported job [{reported_job.get('id')}] {reported_job.get('cmd')}")
+    if breakage.get("reported_by") or breakage.get("reported_at"):
+        lines.append(
+            f"  reported by {breakage.get('reported_by', '?')} at {breakage.get('reported_at', '?')}"
+        )
+    reset_job = breakage.get("reset_job") or {}
+    if reset_job:
+        result = breakage.get("reset_result", "running")
+        lines.append(f"  reset [{reset_job.get('id')}] {result}")
+    return lines
+
+
 @server.tool(name="result")
 async def result(job_id: str) -> str:
     """Wait for job and return output."""
@@ -192,9 +217,11 @@ async def status() -> str:
     if state == "dead":
         reason = device.get("dead_reason") or "reboot required"
         lines.append(f"!!! DEVICE DEAD since {device.get('dead_since')} — {reason}")
+        lines.extend(_breakage_lines(device.get("last_breakage")))
         lines.append("")
     elif state == "resetting" or device.get("reset_pending"):
         lines.append("!!! DEVICE RESET in progress — jobs are held until the device is healthy")
+        lines.extend(_breakage_lines(device.get("last_breakage")))
         lines.append("")
 
     current = data.get("current")
@@ -239,6 +266,13 @@ async def status() -> str:
             lines.append(f"  [{r['id']}] {tag} {r.get('elapsed', '?')}s  {r['cmd']}{suffix}")
 
     return "\n".join(lines)
+
+
+@server.tool(name="last_breakage")
+async def last_breakage() -> str:
+    """Show the last reported broken-device culprit and reset log."""
+    result = await _get("/breakage")
+    return json.dumps(result, indent=2)
 
 
 @server.tool(name="kill")

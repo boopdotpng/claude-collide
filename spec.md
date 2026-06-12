@@ -52,6 +52,11 @@ It is intended to be the source of truth for feature scope and runtime semantics
   - otherwise -> `scheduled` (the worker runs it before dispatching more jobs)
 - The currently running job is allowed to finish (bounded by its timeout);
   the reset runs before the next dispatch.
+- Reset reports record `last_breakage`, exposed in `/reset`, `/status`, and
+  `/breakage`. The suspected culprit is the reported `job_id` when provided,
+  otherwise the currently running non-reset job, otherwise the latest completed
+  non-reset job. The record includes the command, client, output file, reset
+  epoch, reporter, and reset job/result when known.
 - Reset procedure (worker thread): run `TT_DEVICE_RESET_CMD`, then verify with
   `TT_DEVICE_PROBE_CMD`. On probe failure, retry up to `TT_DEVICE_RESET_RETRIES`
   more times (default 1). Each reset run is recorded as a synthetic job with
@@ -163,15 +168,21 @@ Behavior:
 
 ### POST `/reset`
 
-Request JSON: `{"job_id": "<failing job, optional>"}`
+Request JSON: `{"job_id": "<failing job, optional>", "client_id": "agent-1a2b3c4d"}`
 
 - Reports a broken device / requests a reset. Never queues a job.
 - Returns HTTP 200 with `action` one of:
   - `already_reset`: the referenced job ran before the latest reset; resubmit
   - `joined`: a reset is already pending or in progress
   - `scheduled`: a reset will run before the next job dispatch
-- Plus `device_state`, `reset_epoch`, and a human-readable `hint`.
+- Plus `device_state`, `reset_epoch`, `breakage`, and a human-readable `hint`.
 - Unknown `job_id` returns HTTP 404. Dead device returns HTTP 503.
+
+### GET `/breakage`
+
+Returns `{"last_breakage": ...}` where the value is `null` until a reset has
+been requested. This is the direct lookup for the suspected device-breaking
+job and its output file.
 
 ### POST `/cancel`
 

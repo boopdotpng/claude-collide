@@ -753,14 +753,22 @@ class DeviceHealthTest(QueueServerTestBase):
     code, first = self.post_status("/reset", {"job_id": job["job_id"]})
     self.assertEqual(code, 200)
     self.assertEqual(first["action"], "scheduled")
+    self.assertEqual(first["breakage"]["reported_job"]["id"], job["job_id"])
+    self.assertEqual(first["breakage"]["suspect_job"]["id"], job["job_id"])
+    self.assertEqual(first["breakage"]["suspect_job"]["output_file"], job["output_file"])
 
     # Everyone else piling on while the reset is pending/running just joins it.
     for _ in range(5):
       code, again = self.post_status("/reset", {"job_id": job["job_id"]})
       self.assertEqual(code, 200)
       self.assertEqual(again["action"], "joined")
+      self.assertEqual(again["breakage"]["suspect_job"]["id"], job["job_id"])
 
     self.wait_for_device("healthy", epoch=1)
+    breakage = self.get_json("/breakage")["last_breakage"]
+    self.assertEqual(breakage["suspect_job"]["id"], job["job_id"])
+    self.assertEqual(breakage["reset_result"], "healthy")
+    self.assertEqual(breakage["reset_job"]["mode"], "reset")
 
     # Stale report for a pre-reset job: no new reset.
     code, stale = self.post_status("/reset", {"job_id": job["job_id"]})
@@ -833,6 +841,8 @@ class DeviceHealthTest(QueueServerTestBase):
 
     code, resp = self.post_status("/reset", {})
     self.assertEqual(resp["action"], "scheduled")
+    self.assertIsNone(resp["breakage"]["reported_job"])
+    self.assertEqual(resp["breakage"]["suspect_job"]["id"], blocker["job_id"])
 
     # The running job is allowed to finish normally.
     blocker_result = self.wait_for_done(blocker["job_id"])
@@ -847,6 +857,8 @@ class DeviceHealthTest(QueueServerTestBase):
 
     device = self.wait_for_device("dead")
     self.assertIn("reboot", device["dead_reason"])
+    self.assertEqual(device["last_breakage"]["suspect_job"]["id"], blocker["job_id"])
+    self.assertEqual(device["last_breakage"]["reset_result"], "dead")
 
     # New submissions are rejected with 503 + reboot message.
     code, resp = self.post_status("/queue", {

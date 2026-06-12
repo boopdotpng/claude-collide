@@ -45,6 +45,7 @@ device.
 | `tt_smi_status()` | No | Print a one-shot `tt-smi --snapshot` telemetry view without consuming a queue slot |
 | `result(job_id)` | Yes | Wait for a job to finish, return full output |
 | `status()` | No | Show running, queued, and recent jobs |
+| `last_breakage()` | No | Show the last broken-device report, suspected job, output file, and reset log |
 | `kill(job_id="")` | No | Stop the running job, sending Ctrl+C first and force-killing only if needed |
 | `cancel(job_id)` | No | Cancel one of your queued (not yet running) jobs |
 | `reset(job_id="")` | No | Report a broken device; the server coalesces resets and holds the queue while resetting |
@@ -65,7 +66,7 @@ Each MCP server process generates a stable client id at startup (override with `
 
 ## Device health and resets
 
-`reset(job_id)` does not queue a reset command — it *reports* a broken device. The server coalesces reports using reset epochs: if the device was already reset since your failing job ran, you get `already_reset` (just resubmit); if a reset is pending or running, you get `joined`; otherwise one reset is `scheduled`. Twenty agents reporting the same breakage produce exactly one reset.
+`reset(job_id)` does not queue a reset command — it *reports* a broken device. The server coalesces reports using reset epochs: if the device was already reset since your failing job ran, you get `already_reset` (just resubmit); if a reset is pending or running, you get `joined`; otherwise one reset is `scheduled`. Twenty agents reporting the same breakage produce exactly one reset. Reset responses and `last_breakage()` include the reported job when provided, plus the server's suspected culprit: the reported job, otherwise the currently running non-reset job, otherwise the most recently completed non-reset job. That record includes the command, client, and output file.
 
 The reset runs between jobs (the current job finishes first), then the device is verified with `tt-smi --snapshot`. While resetting, the queue is held. If the probe still fails after a retry, the server escalates to a **deep reset**: a PCI remove + rescan (`echo 1 > /sys/bus/pci/devices/<BDF>/remove`, then `echo 1 > /sys/bus/pci/rescan`) via a root-owned helper, followed by one more `tt-smi -r` + probe. This recovers devices that have fallen off the bus, where a tt-smi-level reset can't reach them. Only if that also fails is the device declared **dead**: every queued job is failed with a `DEVICE UNRECOVERABLE … host reboot is required` message in its output (so agents blocked on `result` see it), new submissions get HTTP 503, and `status()` shows a dead-device banner. After the host reboots, the systemd service restart brings the queue back healthy.
 
