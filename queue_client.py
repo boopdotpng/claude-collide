@@ -73,6 +73,8 @@ def wait_for_job(base: str, job_id: str, poll_interval: float = 0.5) -> dict:
         "elapsed": result["elapsed"],
         "output_file": output_file,
         "output": read_output_file(output_file),
+        "timed_out": bool(result.get("timed_out")),
+        "timeout_message": result.get("timeout_message"),
       }
     time.sleep(interval)
     interval = min(interval * 2, poll_interval)

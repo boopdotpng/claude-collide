@@ -13,7 +13,7 @@ server enters a "dead" state — all queued jobs are failed with a reboot-requir
 message and new submissions are rejected with HTTP 503.
 
 Endpoints:
-  POST /queue   {"cmd": "...", "cwd": "...", "timeout": 120, "repeat": 1,
+  POST /queue   {"cmd": "...", "cwd": "...", "repeat": 1,
                  "client_id": "agent-xyz"}
                 -> {"job_id", "output_file", "position", "estimated_wait_sec"}
 
@@ -54,8 +54,7 @@ from urllib.parse import parse_qs, urlparse
 
 HOST = os.environ.get("TT_DEVICE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
-DEFAULT_TIMEOUT = int(os.environ.get("TT_DEVICE_TIMEOUT", "120"))
-DEFAULT_OPEN_TIMEOUT = int(os.environ.get("TT_DEVICE_OPEN_TIMEOUT", "180"))
+RUN_TIMEOUT = 25
 REPO_ROOT = Path(__file__).resolve().parent
 LOG_DIR = Path(os.environ.get("TT_DEVICE_LOG_DIR", str(REPO_ROOT / "logs")))
 DB_PATH = LOG_DIR / "jobs.sqlite3"
@@ -65,6 +64,9 @@ STOP_GRACE_SEC = 8
 DEFAULT_CHILD_OOM_SCORE_ADJ = "500"
 DEFAULT_CLIENT_ID = "anon"
 MAX_CLIENT_ID_LEN = 128
+TENSTORRENT_KERNEL_MODULE = "tenstorrent"
+LSMOD_CMD = os.environ.get("TT_DEVICE_LSMOD_CMD", "/usr/bin/lsmod")
+QUEUE_DISABLED_MSG = "tenstorrent module loaded, blackhole-py will not work"
 
 TT_SMI_PATH = os.environ.get(
   "TT_DEVICE_TT_SMI", os.path.expanduser("~/tenstorrent/blackhole-py/tt-smi.py")
@@ -159,6 +161,45 @@ class DeviceDeadError(RuntimeError):
   """Raised when the device is dead and a host reboot is required."""
 
 
+class QueueDisabledError(RuntimeError):
+  """Raised when the queue should not accept or run device jobs."""
+
+
+def _tenstorrent_kernel_module_loaded() -> bool:
+  try:
+    proc = subprocess.run(
+      shlex.split(LSMOD_CMD),
+      stdout=subprocess.PIPE,
+      stderr=subprocess.DEVNULL,
+      text=True,
+      timeout=2,
+      check=False,
+    )
+  except (OSError, subprocess.TimeoutExpired, ValueError):
+    return False
+  return any(TENSTORRENT_KERNEL_MODULE in line for line in proc.stdout.splitlines())
+
+
+def _queue_disabled_reason() -> str | None:
+  if _tenstorrent_kernel_module_loaded():
+    return QUEUE_DISABLED_MSG
+  return None
+
+
+def _run_timeout(value) -> int:
+  if value is None:
+    return RUN_TIMEOUT
+  try:
+    timeout = int(value)
+  except (TypeError, ValueError):
+    raise ValueError("timeout must be an integer")
+  return max(1, min(timeout, RUN_TIMEOUT))
+
+
+def _timeout_message(job: "Job") -> str:
+  return f"Command timed out after {job.timeout}s; the queue sent SIGKILL."
+
+
 @dataclass
 class Job:
   id: str
@@ -186,6 +227,7 @@ class Job:
   stop_requested_at: float | None = None
   stop_escalated_at: float | None = None
   log_size: int = 0
+  timed_out: bool = False
 
 
 def _job_ref(job: Job | None) -> dict | None:
@@ -258,7 +300,8 @@ class JobStore:
           log_size INTEGER NOT NULL DEFAULT 0,
           updated_at REAL NOT NULL,
           client_id TEXT NOT NULL DEFAULT 'anon',
-          reset_epoch INTEGER NOT NULL DEFAULT 0
+          reset_epoch INTEGER NOT NULL DEFAULT 0,
+          timed_out INTEGER NOT NULL DEFAULT 0
         )
       """)
       existing = {
@@ -271,6 +314,10 @@ class JobStore:
       if "reset_epoch" not in existing:
         conn.execute(
           "ALTER TABLE jobs ADD COLUMN reset_epoch INTEGER NOT NULL DEFAULT 0"
+        )
+      if "timed_out" not in existing:
+        conn.execute(
+          "ALTER TABLE jobs ADD COLUMN timed_out INTEGER NOT NULL DEFAULT 0"
         )
       conn.execute("""
         CREATE TABLE IF NOT EXISTS log_chunks (
@@ -333,9 +380,9 @@ class JobStore:
           started_at, finished_at, exit_code, elapsed, output_file,
           repeat_current, repeat_completed, first_iteration_elapsed,
           per_iter_estimate_sec, stop_requested_at, stop_escalated_at,
-          log_size, updated_at, client_id, reset_epoch
+          log_size, updated_at, client_id, reset_epoch, timed_out
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           cmd = excluded.cmd,
           cwd = excluded.cwd,
@@ -359,7 +406,8 @@ class JobStore:
           log_size = excluded.log_size,
           updated_at = excluded.updated_at,
           client_id = excluded.client_id,
-          reset_epoch = excluded.reset_epoch
+          reset_epoch = excluded.reset_epoch,
+          timed_out = excluded.timed_out
         """,
         (
           job.id, job.cmd, job.cwd, job.timeout, job.repeat,
@@ -368,7 +416,7 @@ class JobStore:
           job.elapsed, job.output_file, job.repeat_current, job.repeat_completed,
           job.first_iteration_elapsed, job.per_iter_estimate_sec,
           job.stop_requested_at, job.stop_escalated_at, job.log_size,
-          time.time(), job.client_id, job.reset_epoch,
+          time.time(), job.client_id, job.reset_epoch, int(job.timed_out),
         ),
       )
 
@@ -483,6 +531,7 @@ class JobStore:
       stop_requested_at=row["stop_requested_at"],
       stop_escalated_at=row["stop_escalated_at"],
       log_size=int(row["log_size"] or 0),
+      timed_out=bool(row["timed_out"]),
     )
 
   def _history_row(self, row: sqlite3.Row) -> dict:
@@ -501,6 +550,7 @@ class JobStore:
       "client": row["client_id"] or DEFAULT_CLIENT_ID,
       "repeat_completed": row["repeat_completed"],
       "per_iter_estimate_sec": round(row["per_iter_estimate_sec"], 2),
+      "timed_out": bool(row["timed_out"]),
     }
 
 
@@ -562,18 +612,7 @@ class DeviceQueue:
 
     per_iter = max(1.0, job.per_iter_estimate_sec)
     if job.status == "queued":
-      if job.mode == "open" and job.timeout <= 0:
-        return 0
       return int(round(job.repeat * per_iter))
-
-    if job.mode == "open":
-      if job.stop_requested_at is not None:
-        grace_elapsed = max(0.0, now - job.stop_requested_at)
-        return max(0, int(round(STOP_GRACE_SEC - grace_elapsed)))
-      if job.timeout <= 0:
-        return 0
-      deadline = (job.started_at or now) + job.timeout
-      return max(0, int(round(deadline - now)))
 
     current_started = job.current_iteration_started_at or job.started_at or now
     current_elapsed = max(0.0, now - current_started)
@@ -608,7 +647,7 @@ class DeviceQueue:
       self,
       cmd: str,
       cwd: str,
-      timeout: int,
+      timeout: int | None,
       repeat: int,
       mode: str = "run",
       env: dict[str, str] | None = None,
@@ -616,12 +655,14 @@ class DeviceQueue:
   ) -> tuple["Job", int, int]:
     """Submit a job. Returns (job, position, estimated_wait_sec) computed atomically."""
     _validate_job_command(cmd)
+    disabled_reason = _queue_disabled_reason()
+    if disabled_reason is not None:
+      raise QueueDisabledError(disabled_reason)
+    timeout = _run_timeout(timeout)
     if repeat < 1:
       raise ValueError("repeat must be >= 1")
-    if mode not in ("run", "open"):
-      raise ValueError("mode must be 'run' or 'open'")
-    if mode == "open" and repeat != 1:
-      raise ValueError("open jobs do not support repeat")
+    if mode != "run":
+      raise ValueError("mode must be 'run'")
     if env is None:
       env = {}
     if not isinstance(env, dict):
@@ -650,6 +691,9 @@ class DeviceQueue:
     )
 
     with self._cond:
+      disabled_reason = _queue_disabled_reason()
+      if disabled_reason is not None:
+        raise QueueDisabledError(disabled_reason)
       if self._device_state == "dead":
         raise DeviceDeadError(self._dead_reason or REBOOT_REQUIRED_MSG)
       job.reset_epoch = self._reset_epoch
@@ -815,8 +859,11 @@ class DeviceQueue:
       return sum(len(q) for q in self._pending.values())
 
   def _device_status_locked(self) -> dict:
+    disabled_reason = _queue_disabled_reason()
     return {
-      "state": self._device_state,
+      "state": "disabled" if disabled_reason else self._device_state,
+      "queue_disabled": disabled_reason is not None,
+      "disabled_reason": disabled_reason,
       "reset_epoch": self._reset_epoch,
       "reset_pending": self._reset_pending,
       "last_reset_at": _format_timestamp(self._last_reset_at),
@@ -906,7 +953,10 @@ class DeviceQueue:
         "output_file": job.output_file,
         "exit_code": job.exit_code,
         "elapsed": job.elapsed,
+        "timed_out": job.timed_out,
       }
+      if job.timed_out:
+        data["timeout_message"] = _timeout_message(job)
 
       if position is not None:
         data["position"] = position
@@ -1127,7 +1177,8 @@ class DeviceQueue:
           self._reset_pending = False
           self._device_state = "resetting"
           return "reset", None
-        if self._device_state == "healthy":
+        disabled_reason = _queue_disabled_reason()
+        if self._device_state == "healthy" and disabled_reason is None:
           job = self._pick_job_locked()
           if job is not None:
             job.status = "running"
@@ -1136,7 +1187,7 @@ class DeviceQueue:
             self._current = job
             self._store.save_job(job)
             return "job", job
-        self._cond.wait()
+        self._cond.wait(timeout=1.0 if disabled_reason is not None else None)
 
   def _run_logged_command(self, job: Job, out_f, cmd: str | list[str], timeout: int) -> int:
     """Run a health command (reset/probe), appending its output to the job log."""
@@ -1302,20 +1353,14 @@ class DeviceQueue:
         deadline = job.started_at + job.timeout if job.timeout > 0 else None
         exit_code = 0
         with open(job.output_file, "wb") as out_f:
-          iterations = range(1, job.repeat + 1) if job.mode == "run" else range(1, 2)
+          iterations = range(1, job.repeat + 1)
           for iteration in iterations:
             with self._lock:
               job.repeat_current = iteration
               job.current_iteration_started_at = time.time()
               self._store.save_job(job)
 
-            if job.mode == "open":
-              self._append_output(
-                job,
-                out_f,
-                f"[tt-device-queue] Open job started (timeout={job.timeout}s)\n".encode(),
-              )
-            elif job.repeat > 1:
+            if job.repeat > 1:
               self._append_output(
                 job,
                 out_f,
@@ -1336,13 +1381,16 @@ class DeviceQueue:
             try:
               exit_code = self._wait_for_process(job, proc, out_f, deadline)
             except subprocess.TimeoutExpired:
+              with self._lock:
+                job.timed_out = True
+                self._store.save_job(job)
               self._kill_for_timeout(proc)
               self._drain_process_output(job, proc, out_f)
               exit_code = -9
               self._append_output(
                 job,
                 out_f,
-                f"\n[tt-device-queue] Timed out after {job.timeout}s — sent SIGKILL\n".encode(),
+                f"\n[tt-device-queue] {_timeout_message(job)}\n".encode(),
               )
             finally:
               if proc.stdout is not None:
@@ -1406,6 +1454,9 @@ class DeviceQueue:
           "id": job.id, "cmd": job.cmd, "cwd": job.cwd,
           "exit_code": exit_code, "elapsed": elapsed, "repeat": job.repeat,
           "mode": job.mode,
+          "timeout": job.timeout,
+          "timed_out": job.timed_out,
+          "timeout_message": _timeout_message(job) if job.timed_out else None,
           "repeat_completed": job.repeat_completed,
           "first_iteration_elapsed": job.first_iteration_elapsed,
           "per_iter_estimate_sec": round(job.per_iter_estimate_sec, 2),
@@ -1489,6 +1540,8 @@ class Handler(BaseHTTPRequestHandler):
           "repeat_completed": job.repeat_completed,
           "started_at": _format_timestamp(job.started_at),
           "finished_at": _format_timestamp(job.finished_at),
+          "timed_out": job.timed_out,
+          "timeout_message": _timeout_message(job) if job.timed_out else None,
         })
       elif job.status == "running":
         running_for = round(time.time() - (job.started_at or job.submitted), 1)
@@ -1504,6 +1557,7 @@ class Handler(BaseHTTPRequestHandler):
           "first_iteration_elapsed": job.first_iteration_elapsed,
           "per_iter_estimate_sec": round(job.per_iter_estimate_sec, 2),
           "started_at": _format_timestamp(job.started_at),
+          "timed_out": False,
         })
       else:
         pos, wait_sec = dq.queue_position(job_id)
@@ -1519,6 +1573,7 @@ class Handler(BaseHTTPRequestHandler):
           "first_iteration_elapsed": job.first_iteration_elapsed,
           "per_iter_estimate_sec": round(job.per_iter_estimate_sec, 2),
           "submitted_at": _format_timestamp(job.submitted),
+          "timed_out": False,
         })
       return
 
@@ -1606,20 +1661,19 @@ class Handler(BaseHTTPRequestHandler):
         self._json_response(400, {"error": "Missing 'cmd'"})
         return
 
-      timeout = body.get("timeout")
-      if timeout is None:
-        timeout = DEFAULT_OPEN_TIMEOUT if mode == "open" else DEFAULT_TIMEOUT
-
       try:
         job, jobs_ahead, wait_sec = dq.submit(
           cmd=cmd,
           cwd=body.get("cwd", ""),
-          timeout=timeout,
+          timeout=body.get("timeout"),
           repeat=body.get("repeat", 1),
           mode=mode,
           env=body.get("env", {}),
           client_id=body.get("client_id", DEFAULT_CLIENT_ID),
         )
+      except QueueDisabledError as exc:
+        self._json_response(503, {"error": str(exc), "device_state": "disabled"})
+        return
       except DeviceDeadError as exc:
         self._json_response(503, {"error": str(exc), "device_state": "dead"})
         return
@@ -1661,7 +1715,7 @@ def main():
 
   server = HTTPServer((HOST, PORT), Handler)
   print(f"tt-device-queue listening on http://{HOST}:{PORT}")
-  print(f"Default timeout: {DEFAULT_TIMEOUT}s")
+  print(f"Run timeout cap: {RUN_TIMEOUT}s")
   print(f"Output dir: {LOG_DIR}")
   print(f"SQLite db: {DB_PATH}")
   try:

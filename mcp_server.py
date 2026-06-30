@@ -17,8 +17,7 @@ from queue_client import post, get, run_tt_smi_snapshot, wait_for_job
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
 BASE = f"http://{HOST}:{PORT}"
-DEFAULT_TIMEOUT = 120
-DEFAULT_OPEN_TIMEOUT = 180
+RUN_TIMEOUT = 25
 
 # One MCP server process == one agent session. This id is the fairness unit:
 # the queue server round-robins across client ids so no agent can dominate.
@@ -66,12 +65,11 @@ def _write_python_script(script: str) -> Path:
 async def queue(
     cmd: str,
     cwd: str = "",
-    timeout: int = DEFAULT_TIMEOUT,
     repeat: int = 1,
 ) -> str:
     """Queue device command. Returns job_id. PYTHONPATH includes "."."""
     result = await _post("/queue", {
-        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+        "cmd": cmd, "cwd": cwd, "timeout": RUN_TIMEOUT, "repeat": repeat,
         "mode": "run", "client_id": CLIENT_ID,
     })
 
@@ -86,35 +84,10 @@ async def queue(
     }, indent=2)
 
 
-@server.tool(name="open_forever")
-async def open_forever(
-    cmd: str,
-    cwd: str = "",
-    timeout: int = DEFAULT_OPEN_TIMEOUT,
-) -> str:
-    """Queue long-running device command. Stop with kill(job_id)."""
-    result = await _post("/queue", {
-        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": 1,
-        "mode": "open", "client_id": CLIENT_ID,
-    })
-
-    return json.dumps({
-        "job_id": result["job_id"],
-        "output_file": result["output_file"],
-        "position": result["position"],
-        "estimated_wait_sec": result["estimated_wait_sec"],
-        "estimated_run_sec": result.get("estimated_run_sec"),
-        "mode": result.get("mode", "open"),
-        "timeout": result.get("timeout", timeout),
-        "hint": "Use job/logs, then kill(job_id).",
-    }, indent=2)
-
-
 @server.tool(name="queue_python")
 async def queue_python(
     script: str,
     cwd: str = "",
-    timeout: int = DEFAULT_TIMEOUT,
     repeat: int = 1,
     python: str = "python3",
     args: list[str] | None = None,
@@ -123,7 +96,7 @@ async def queue_python(
     script_path = await asyncio.to_thread(_write_python_script, script)
     cmd = shlex.join([python, str(script_path), *(args or [])])
     result = await _post("/queue", {
-        "cmd": cmd, "cwd": cwd, "timeout": timeout, "repeat": repeat,
+        "cmd": cmd, "cwd": cwd, "timeout": RUN_TIMEOUT, "repeat": repeat,
         "mode": "run", "client_id": CLIENT_ID,
     })
 
@@ -192,7 +165,11 @@ async def result(job_id: str) -> str:
     result = await _wait_for_job(job_id)
 
     exit_code = result["exit_code"]
-    status = "OK" if exit_code == 0 else f"FAILED (exit code {exit_code})"
+    timed_out = bool(result.get("timed_out"))
+    if timed_out:
+        status = "TIMED OUT"
+    else:
+        status = "OK" if exit_code == 0 else f"FAILED (exit code {exit_code})"
 
     lines = [
         f"Status: {status}",
@@ -202,6 +179,8 @@ async def result(job_id: str) -> str:
         "--- Command Output ---",
         result["output"],
     ]
+    if timed_out:
+        lines.insert(1, result.get("timeout_message") or "Command timed out.")
     return "\n".join(lines)
 
 
@@ -228,8 +207,6 @@ async def status() -> str:
     if current:
         client = f" ({current['client']})" if current.get("client") else ""
         lines.append(f"RUNNING: [{current['id']}]{client} {current['cmd']}")
-        if current.get("mode") == "open":
-            lines.append("         mode open")
         repeat = current.get("repeat", 1)
         if repeat > 1:
             progress = f"  repeat {current.get('repeat_current', 0)}/{repeat}"
@@ -247,8 +224,6 @@ async def status() -> str:
         for p in pending:
             client = f" ({p['client']})" if p.get("client") else ""
             lines.append(f"  [{p['id']}]{client} {p['cmd']}")
-            if p.get("mode") == "open":
-                lines.append("           mode open")
             repeat = f"  repeat {p['repeat']}x" if p.get('repeat', 1) > 1 else ""
             eta = p.get("estimated_wait_sec")
             eta_text = f"  eta ~{eta}s" if eta is not None else ""
@@ -260,7 +235,10 @@ async def status() -> str:
     if recent:
         lines.append(f"\nRECENT:")
         for r in recent:
-            tag = "OK" if r.get("exit_code", 1) == 0 else f"FAIL({r.get('exit_code')})"
+            if r.get("timed_out"):
+                tag = "TIMEOUT"
+            else:
+                tag = "OK" if r.get("exit_code", 1) == 0 else f"FAIL({r.get('exit_code')})"
             repeat = r.get("repeat", 1)
             suffix = f"  repeat {r.get('repeat_completed', 0)}/{repeat}" if repeat > 1 else ""
             lines.append(f"  [{r['id']}] {tag} {r.get('elapsed', '?')}s  {r['cmd']}{suffix}")

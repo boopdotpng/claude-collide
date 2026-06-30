@@ -50,7 +50,7 @@ It is intended to be the source of truth for feature scope and runtime semantics
   - job's epoch < current epoch -> `already_reset` (no new reset; resubmit)
   - reset pending or in progress -> `joined`
   - otherwise -> `scheduled` (the worker runs it before dispatching more jobs)
-- The currently running job is allowed to finish (bounded by its timeout);
+- The currently running job is allowed to finish (bounded by the run timeout);
   the reset runs before the next dispatch.
 - Reset reports record `last_breakage`, exposed in `/reset`, `/status`, and
   `/breakage`. The suspected culprit is the reported `job_id` when provided,
@@ -81,25 +81,22 @@ Each queued job has:
 - `job_id`: 8 hex chars, unique per server lifetime
 - `cmd`: shell command string executed with `shell=True`
 - `cwd`: working directory passed to `subprocess.Popen`
-- `timeout`: total timeout budget for the whole job, not per repeat iteration
+- `timeout`: total timeout budget for the whole job, capped at 25 seconds
 - `repeat`: number of sequential executions inside the same job, minimum `1`
 - `env`: per-job environment variables merged into the subprocess environment
-- `mode`: `run` for normal jobs, `open` for intentionally long-running jobs,
-  `reset` for server-managed device resets
+- `mode`: `run` for normal jobs, `reset` for server-managed device resets
 - `client_id`: fairness unit for scheduling; defaults to `anon`, max 128 chars
 - `reset_epoch`: the device reset epoch the job ran under
 - `status`: `queued`, `running`, or `done`
 - `output_file`: `./logs/<job_id>/output` by default, overridable via `TT_DEVICE_LOG_DIR`
 - timestamps: `submitted_at`, `started_at`, `finished_at`
-- results: `exit_code`, `elapsed`
+- results: `exit_code`, `elapsed`, `timed_out`, `timeout_message`
 - repeat progress: `repeat_current`, `repeat_completed`, `first_iteration_elapsed`, `per_iter_estimate_sec`
 
 ## Repeat Semantics
 
 - `repeat=1` behaves like a normal single command execution.
 - `repeat>1` executes the same command sequentially inside one queued job.
-- `mode=open` keeps the queue slot occupied until the process exits, times out, or is explicitly stopped.
-- `mode=open` requires `repeat=1`.
 - The queue creates exactly one `job_id` and one output file for the entire repeated run.
 - Before each repeated iteration, the server appends a marker line:
   - `[tt-device-queue] Repeat N/M`
@@ -107,6 +104,7 @@ Each queued job has:
 - If the job times out, the server sends `SIGKILL` to the process group immediately. Timed-out jobs end with exit code `-9`.
 - Explicit stop requests send Ctrl+C first, then escalate to `SIGKILL` if needed.
 - Timeout applies to the full repeated job, not to each iteration independently.
+- MCP queue tools do not expose a timeout argument; all submitted commands use the 25 second cap.
 
 ## Output and Metadata Files
 
@@ -138,7 +136,6 @@ Request JSON:
 {
   "cmd": "python3 script.py",
   "cwd": "/path/to/repo",
-  "timeout": 120,
   "repeat": 1,
   "mode": "run",
   "env": {"TT_USB": "1"},
@@ -150,8 +147,8 @@ Behavior:
 
 - `cmd` is required and must be non-empty after stripping.
 - `repeat` must be `>= 1`.
-- `mode` defaults to `run` and must be either `run` or `open`.
-- `mode=open` defaults to `180s` timeout when one is not provided.
+- `mode` defaults to `run`; new submissions must use `run`.
+- `timeout` is optional for raw HTTP callers, but values above 25 seconds are capped to 25 seconds. MCP callers cannot set it.
 - `env` defaults to `{}` and must be an object whose names and values are strings.
 - `client_id` defaults to `anon`; must be a non-empty string of at most 128 chars.
 - Returns HTTP 503 with the reboot-required message when the device is dead.
@@ -220,6 +217,7 @@ Returns one of:
   - `elapsed`
   - `estimated_remaining_sec=0`
   - repeat metadata
+  - `timed_out`; when true, `timeout_message` is included
 
 Unknown jobs return HTTP 404.
 
@@ -232,6 +230,7 @@ Returns structured metadata for the job, including:
 - repeat progress and ETA fields
 - queue position when queued
 - `running_sec` when running
+- `timed_out`; when true, `timeout_message` is included
 
 Unknown jobs return HTTP 404.
 
@@ -281,9 +280,8 @@ Behavior:
 
 Implemented tools in `mcp_server.py`:
 
-- `queue(cmd, cwd, timeout, repeat)`
-- `open_forever(cmd, cwd, timeout)`
-- `queue_python(script, cwd, timeout, repeat, python, args)`
+- `queue(cmd, cwd, repeat)`
+- `queue_python(script, cwd, repeat, python, args)`
 - `job(job_id)`
 - `logs(job_id, offset, limit)`
 - `tt_smi_status()`
@@ -312,8 +310,6 @@ MCP behavior notes:
 - `queue_python` stores large one-off Python snippets as files before queueing,
   keeping queue metadata readable.
 - `result` waits until completion, then returns the full output text.
-- `open_forever` is only for long-running Tenstorrent hardware work, not
-  ordinary local dev servers or CPU-only log streams.
 - `tt_smi_status` does not use the queue and can run concurrently with queued jobs.
 - `reset` is not queued work and not a direct bypass path; it is a health
   report handled by the server's device state machine.

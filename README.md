@@ -37,9 +37,8 @@ device.
 
 | Tool | Blocks? | Description |
 |---|---|---|
-| `queue(cmd, cwd, timeout, repeat)` | No | Enqueue a command, get back a `job_id` immediately |
-| `open_forever(cmd, cwd, timeout)` | No | Enqueue an intentionally long-running Tenstorrent hardware job that keeps the queue occupied until stopped |
-| `queue_python(script, cwd, timeout, repeat, python, args)` | No | Write a Python snippet to a script file, then enqueue that script |
+| `queue(cmd, cwd, repeat)` | No | Enqueue a command, get back a `job_id` immediately |
+| `queue_python(script, cwd, repeat, python, args)` | No | Write a Python snippet to a script file, then enqueue that script |
 | `job(job_id)` | No | Fetch structured per-job status, timestamps, repeat progress, and queue position |
 | `logs(job_id, offset, limit)` | No | Read current or persisted job output by byte offset without blocking |
 | `tt_smi_status()` | No | Print a one-shot `tt-smi --snapshot` telemetry view without consuming a queue slot |
@@ -52,11 +51,11 @@ device.
 
 `repeat` defaults to `1`. When set higher, the server runs the same command sequentially inside a single queued job, appends all iterations into the same output file, and still returns one `job_id` for the agent to track. It stops immediately on the first failing iteration and exposes repeat progress through `job` and `status`. Initial ETA scales with `repeat`, then refines after the first successful iteration by reusing that iteration's runtime as the per-repeat estimate.
 
+Every queued command has a hard timeout cap of 25 seconds. MCP callers cannot set a timeout. If a command hits the cap, `result(job_id)` starts with `Status: TIMED OUT`, `/result` and `/job` return `timed_out: true` plus `timeout_message`, and the job log contains the timeout message.
+
 The server automatically prepends `.` to `PYTHONPATH` for queued jobs, so agents do not need to add `PYTHONPATH=.`. Normal leading shell assignments such as `MATMUL_PROFILE=1 python3 examples/matmul_peak.py` work as expected.
 
 Use `queue_python` instead of large `python -c` strings or heredocs. The MCP wrapper writes the snippet into `logs/mcp-scripts/` and queues a short command that runs the generated file.
-
-`open_forever` is for Tenstorrent hardware commands that are intentionally meant to stay alive for a while, like device-facing profiler UIs or hardware log streams. It is not for ordinary local dev servers or CPU-only logs. These jobs still use the same queue and stdout file, but they keep the queue slot occupied until they exit or the agent calls `kill(job_id)`. Manual `kill` sends Ctrl+C first and only escalates to SIGKILL if the process ignores it; timeouts send SIGKILL immediately. The default timeout for `open_forever` jobs is 180 seconds.
 
 Logs are persistent by default. The server stores compatibility output files in `./logs/<job_id>/output` and appends the same bytes to `./logs/jobs.sqlite3` as they are produced. Completed jobs remain available through `job`, `logs`, `result`, and `status` after the server restarts. The whole `./logs/` directory is ignored by git.
 
@@ -131,8 +130,7 @@ Drop a `.mcp.json` in your project root:
     "tt-device-queue": {
       "command": "/path/to/tt-device-queue/.venv/bin/python3",
       "args": ["mcp_server.py"],
-      "cwd": "/path/to/tt-device-queue",
-      "timeout": 300
+      "cwd": "/path/to/tt-device-queue"
     }
   }
 }

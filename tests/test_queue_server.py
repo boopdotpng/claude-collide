@@ -31,6 +31,14 @@ class QueueServerTestBase(unittest.TestCase):
     self.server_env = os.environ.copy()
     self.server_env["TT_DEVICE_PORT"] = str(self.port)
     self.server_env["TT_DEVICE_LOG_DIR"] = self.temp_dir.name
+    self.lsmod_output = Path(self.temp_dir.name) / "lsmod.out"
+    self.lsmod_output.write_text("")
+    self.fake_lsmod = Path(self.temp_dir.name) / "lsmod"
+    self.fake_lsmod.write_text("#!/bin/sh\ncat \"$1\"\n")
+    self.fake_lsmod.chmod(0o755)
+    self.server_env["TT_DEVICE_LSMOD_CMD"] = (
+      f"{self.fake_lsmod} {self.lsmod_output}"
+    )
     self.server_env.pop("PYTHONPATH", None)
     self.server_env.update(self.extra_server_env())
     self._start_server()
@@ -126,16 +134,6 @@ class QueueServerTestBase(unittest.TestCase):
     if client is not None:
       payload["client_id"] = client
     return self.post_json("/queue", payload)
-
-  def submit_open(self, cmd: str, timeout: int = 5, env: dict | None = None) -> dict:
-    return self.post_json("/queue", {
-      "cmd": cmd,
-      "cwd": str(REPO_ROOT),
-      "timeout": timeout,
-      "repeat": 1,
-      "mode": "open",
-      "env": env or {},
-    })
 
   def wait_for_done(self, job_id: str, timeout: float = 10.0) -> dict:
     deadline = time.time() + timeout
@@ -261,14 +259,20 @@ class QueueServerTest(QueueServerTestBase):
 
     result = self.wait_for_done(submit["job_id"])
     self.assertEqual(result["exit_code"], -9)
+    self.assertTrue(result["timed_out"])
+    self.assertIn("Command timed out after 1s", result["timeout_message"])
     self.assertEqual(result["repeat_completed"], 0)
     self.assertLess(result["elapsed"], 3)
 
     logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
     self.assertIn("Repeat 1/3", logs["content"])
     self.assertNotIn("Repeat 2/3", logs["content"])
-    self.assertIn("Timed out after 1s", logs["content"])
+    self.assertIn("Command timed out after 1s", logs["content"])
     self.assertIn("SIGKILL", logs["content"])
+
+    job = self.get_json(f"/job/{submit['job_id']}")
+    self.assertTrue(job["timed_out"])
+    self.assertIn("Command timed out after 1s", job["timeout_message"])
 
   def test_queued_command_gets_pythonpath_dot(self):
     code = "import os; print(os.environ.get('PYTHONPATH'))"
@@ -460,81 +464,24 @@ class QueueServerTest(QueueServerTestBase):
     self.assertEqual(result["exit_code"], 0)
     self.assertEqual(result["repeat"], 1)
 
-  def test_open_job_blocks_queue_until_stopped(self):
-    code = (
-      "import signal, sys, time; "
-      "signal.signal(signal.SIGINT, lambda *_: (print('sigint', flush=True), sys.exit(0))); "
-      "print('ready', flush=True); "
-      "time.sleep(30)"
-    )
-    first = self.submit_open(self.python_cmd(code), timeout=10)
+  def test_open_mode_is_rejected(self):
+    code, resp = self.post_status("/queue", {
+      "cmd": "true",
+      "cwd": str(REPO_ROOT),
+      "mode": "open",
+    })
+    self.assertEqual(code, 400)
+    self.assertIn("mode must be 'run'", resp["error"])
 
-    deadline = time.time() + 5
-    running_seen = False
-    while time.time() < deadline:
-      job = self.get_json(f"/job/{first['job_id']}")
-      if job["status"] == "running":
-        running_seen = True
-        self.assertEqual(job["mode"], "open")
-        break
-      time.sleep(0.05)
-    self.assertTrue(running_seen)
-    self.wait_for_logs(first["job_id"], "ready")
+  def test_timeout_is_capped_at_25_seconds(self):
+    submit = self.submit(self.python_cmd("print('capped')"), timeout=90)
+    self.assertEqual(submit["timeout"], 25)
 
-    second = self.submit(self.python_cmd("print('after-open')"), timeout=5)
-    queued = self.get_json(f"/job/{second['job_id']}")
-    self.assertEqual(queued["status"], "queued")
+    job = self.get_json(f"/job/{submit['job_id']}")
+    self.assertEqual(job["timeout"], 25)
 
-    stop = self.post_json("/kill", {"job_id": first["job_id"]})
-    self.assertEqual(stop["killed"]["id"], first["job_id"])
-
-    first_result = self.wait_for_done(first["job_id"])
-    self.assertEqual(first_result["exit_code"], 0)
-
-    second_result = self.wait_for_done(second["job_id"])
-    self.assertEqual(second_result["exit_code"], 0)
-
-    logs = self.get_json(f"/logs/{first['job_id']}?offset=0&limit=4096")
-    self.assertIn("Open job started", logs["content"])
-    self.assertIn("ready", logs["content"])
-    self.assertIn("sigint", logs["content"])
-
-  def test_open_job_that_ignores_sigint_is_force_killed(self):
-    code = (
-      "import signal, time; "
-      "signal.signal(signal.SIGINT, signal.SIG_IGN); "
-      "print('running', flush=True); "
-      "time.sleep(30)"
-    )
-    submit = self.submit_open(self.python_cmd(code), timeout=20)
-
-    deadline = time.time() + 5
-    while time.time() < deadline:
-      job = self.get_json(f"/job/{submit['job_id']}")
-      if job["status"] == "running":
-        break
-      time.sleep(0.05)
-    self.wait_for_logs(submit["job_id"], "running")
-
-    self.post_json("/kill", {"job_id": submit["job_id"]})
-    result = self.wait_for_done(submit["job_id"], timeout=15)
-    self.assertEqual(result["exit_code"], -9)
-
-  def test_open_job_timeout_uses_sigkill(self):
-    code = (
-      "import signal, time; "
-      "signal.signal(signal.SIGINT, signal.SIG_IGN); "
-      "print('running', flush=True); "
-      "time.sleep(30)"
-    )
-    submit = self.submit_open(self.python_cmd(code), timeout=1)
-    result = self.wait_for_done(submit["job_id"], timeout=12)
-    self.assertEqual(result["exit_code"], -9)
-    self.assertLess(result["elapsed"], 3)
-
-    logs = self.get_json(f"/logs/{submit['job_id']}?offset=0&limit=4096")
-    self.assertIn("Timed out after 1s", logs["content"])
-    self.assertIn("SIGKILL", logs["content"])
+    result = self.wait_for_done(submit["job_id"])
+    self.assertEqual(result["exit_code"], 0)
 
   def test_round_robin_interleaves_clients(self):
     seq = Path(self.temp_dir.name) / "seq.txt"
@@ -632,8 +579,28 @@ class QueueServerTest(QueueServerTestBase):
   def test_status_reports_device_healthy(self):
     device = self.get_json("/status")["device"]
     self.assertEqual(device["state"], "healthy")
+    self.assertFalse(device["queue_disabled"])
+    self.assertIsNone(device["disabled_reason"])
     self.assertEqual(device["reset_epoch"], 0)
     self.assertFalse(device["reset_pending"])
+
+  def test_tenstorrent_kernel_module_disables_queue(self):
+    self.lsmod_output.write_text("tenstorrent 16384 0\n")
+
+    code, resp = self.post_status("/queue", {
+      "cmd": "true", "cwd": "", "timeout": 5,
+    })
+    self.assertEqual(code, 503)
+    self.assertEqual(resp["error"], "tenstorrent module loaded, blackhole-py will not work")
+    self.assertEqual(resp["device_state"], "disabled")
+
+    device = self.get_json("/status")["device"]
+    self.assertEqual(device["state"], "disabled")
+    self.assertTrue(device["queue_disabled"])
+    self.assertEqual(
+      device["disabled_reason"],
+      "tenstorrent module loaded, blackhole-py will not work",
+    )
 
   def test_migrates_legacy_db_without_client_columns(self):
     self._stop_server()
