@@ -16,6 +16,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVER_PATH = REPO_ROOT / "server.py"
 DEEP_RESET_HELPER = REPO_ROOT / "tt-pci-deep-reset"
+POLL_INTERVAL = 0.01
 
 
 def free_port() -> int:
@@ -31,14 +32,10 @@ class QueueServerTestBase(unittest.TestCase):
     self.server_env = os.environ.copy()
     self.server_env["TT_DEVICE_PORT"] = str(self.port)
     self.server_env["TT_DEVICE_LOG_DIR"] = self.temp_dir.name
+    self.server_env["TT_DEVICE_PROCESS_POLL_INTERVAL"] = "0.02"
     self.lsmod_output = Path(self.temp_dir.name) / "lsmod.out"
     self.lsmod_output.write_text("")
-    self.fake_lsmod = Path(self.temp_dir.name) / "lsmod"
-    self.fake_lsmod.write_text("#!/bin/sh\ncat \"$1\"\n")
-    self.fake_lsmod.chmod(0o755)
-    self.server_env["TT_DEVICE_LSMOD_CMD"] = (
-      f"{self.fake_lsmod} {self.lsmod_output}"
-    )
+    self.server_env["TT_DEVICE_LSMOD_CMD"] = f"/bin/cat {self.lsmod_output}"
     self.server_env.pop("PYTHONPATH", None)
     self.server_env.update(self.extra_server_env())
     self._start_server()
@@ -82,7 +79,7 @@ class QueueServerTestBase(unittest.TestCase):
         return
       except Exception as exc:  # pragma: no cover - best effort startup loop
         last_error = exc
-        time.sleep(0.05)
+        time.sleep(POLL_INTERVAL)
     output = ""
     if self.server.stdout is not None:
       output = self.server.stdout.read()
@@ -141,7 +138,7 @@ class QueueServerTestBase(unittest.TestCase):
       result = self.get_json(f"/result/{job_id}")
       if result["status"] == "done":
         return result
-      time.sleep(0.05)
+      time.sleep(POLL_INTERVAL)
     raise AssertionError(f"job {job_id} did not finish in time")
 
   def wait_for_logs(self, job_id: str, needle: str, timeout: float = 5.0) -> str:
@@ -151,7 +148,7 @@ class QueueServerTestBase(unittest.TestCase):
       content = logs.get("content", "")
       if needle in content:
         return content
-      time.sleep(0.05)
+      time.sleep(POLL_INTERVAL)
     raise AssertionError(f"log output for {job_id} did not contain {needle!r}")
 
   def python_cmd(self, code: str) -> str:
@@ -160,13 +157,20 @@ class QueueServerTestBase(unittest.TestCase):
   def seq_cmd(self, name: str, seq_file: Path) -> str:
     return f"/bin/sh -c {shlex.quote(f'echo {name} >> {seq_file}')}"
 
+  def gate_cmd(self, gate_file: Path) -> str:
+    return " ".join([
+      "/bin/sh",
+      "-c",
+      shlex.quote(f"while [ ! -e {shlex.quote(str(gate_file))} ]; do sleep 0.01; done"),
+    ])
+
   def wait_for_running(self, job_id: str, timeout: float = 5.0) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
       job = self.get_json(f"/job/{job_id}")
       if job["status"] == "running":
         return job
-      time.sleep(0.05)
+      time.sleep(POLL_INTERVAL)
     raise AssertionError(f"job {job_id} did not start running in time")
 
   def wait_for_device(self, state: str, epoch: int | None = None, timeout: float = 8.0) -> dict:
@@ -176,7 +180,7 @@ class QueueServerTestBase(unittest.TestCase):
       last = self.get_json("/status")["device"]
       if last["state"] == state and (epoch is None or last["reset_epoch"] == epoch):
         return last
-      time.sleep(0.05)
+      time.sleep(POLL_INTERVAL)
     raise AssertionError(f"device never reached {state} (epoch {epoch}): {last}")
 
 
@@ -342,7 +346,8 @@ class QueueServerTest(QueueServerTestBase):
     self.assertIn("250\n", logs["content"])
 
   def test_job_endpoint_reports_queue_running_and_done_metadata(self):
-    first = self.submit("sleep 1", timeout=5)
+    gate = Path(self.temp_dir.name) / "job_endpoint_gate"
+    first = self.submit(self.gate_cmd(gate), timeout=5)
     second = self.submit(self.python_cmd("print('second')"), timeout=5, repeat=2)
 
     queued = self.get_json(f"/job/{second['job_id']}")
@@ -360,9 +365,10 @@ class QueueServerTest(QueueServerTestBase):
         self.assertEqual(running["position"], 0)
         self.assertIsNotNone(running["started_at"])
         break
-      time.sleep(0.05)
+      time.sleep(POLL_INTERVAL)
     self.assertTrue(running_seen)
 
+    gate.touch()
     self.wait_for_done(first["job_id"])
     self.wait_for_done(second["job_id"])
 
@@ -374,18 +380,20 @@ class QueueServerTest(QueueServerTestBase):
     self.assertEqual(done["exit_code"], 0)
 
   def test_initial_repeat_estimate_scales_with_repeat_count(self):
-    submit = self.submit("sleep 1", timeout=5, repeat=4)
+    gate = Path(self.temp_dir.name) / "repeat_estimate_gate"
+    submit = self.submit(self.gate_cmd(gate), timeout=5, repeat=4)
 
     self.assertEqual(submit["estimated_run_sec"], 40)
 
     queued = self.submit(self.python_cmd("print('queued')"), timeout=5)
     self.assertGreaterEqual(queued["estimated_wait_sec"], 30)
 
+    gate.touch()
     self.wait_for_done(submit["job_id"])
     self.wait_for_done(queued["job_id"])
 
   def test_first_iteration_updates_repeat_eta(self):
-    submit = self.submit("sleep 0.4", timeout=5, repeat=4)
+    submit = self.submit("sleep 0.03", timeout=5, repeat=4)
 
     refined = None
     deadline = time.time() + 5
@@ -394,7 +402,7 @@ class QueueServerTest(QueueServerTestBase):
       if job["status"] == "running" and job["repeat_completed"] >= 1:
         refined = job
         break
-      time.sleep(0.05)
+      time.sleep(POLL_INTERVAL)
 
     self.assertIsNotNone(refined)
     self.assertLess(refined["per_iter_estimate_sec"], 2.0)
@@ -405,7 +413,7 @@ class QueueServerTest(QueueServerTestBase):
 
   def test_logs_endpoint_supports_offsets_and_completion(self):
     cmd = self.python_cmd(
-      "import sys, time; sys.stdout.write('A' * 200); sys.stdout.flush(); time.sleep(0.5); print('done')"
+      "import sys, time; sys.stdout.write('A' * 200); sys.stdout.flush(); time.sleep(0.03); print('done')"
     )
     submit = self.submit(cmd, timeout=5)
 
@@ -416,7 +424,7 @@ class QueueServerTest(QueueServerTestBase):
       if logs["content"]:
         first_chunk = logs
         break
-      time.sleep(0.05)
+      time.sleep(POLL_INTERVAL)
     self.assertIsNotNone(first_chunk)
     self.assertTrue(first_chunk["truncated"])
     self.assertEqual(first_chunk["next_offset"], len(first_chunk["content"].encode()))
@@ -485,7 +493,8 @@ class QueueServerTest(QueueServerTestBase):
 
   def test_round_robin_interleaves_clients(self):
     seq = Path(self.temp_dir.name) / "seq.txt"
-    blocker = self.submit("sleep 1", client="agent-a")
+    gate = Path(self.temp_dir.name) / "round_robin_gate"
+    blocker = self.submit(self.gate_cmd(gate), client="agent-a")
     self.wait_for_running(blocker["job_id"])
 
     a1 = self.submit(self.seq_cmd("a1", seq), client="agent-a")
@@ -496,25 +505,29 @@ class QueueServerTest(QueueServerTestBase):
     # ahead of it are the running blocker and a1 only.
     self.assertEqual(b1["position"], 2)
 
+    gate.touch()
     for s in (a1, a2, b1):
       self.wait_for_done(s["job_id"])
     self.assertEqual(seq.read_text().split(), ["a1", "b1", "a2"])
 
   def test_same_client_jobs_stay_fifo(self):
     seq = Path(self.temp_dir.name) / "seq.txt"
-    blocker = self.submit("sleep 0.6", client="agent-a")
+    gate = Path(self.temp_dir.name) / "same_client_gate"
+    blocker = self.submit(self.gate_cmd(gate), client="agent-a")
     self.wait_for_running(blocker["job_id"])
 
     submits = [
       self.submit(self.seq_cmd(name, seq), client="agent-a")
       for name in ("a1", "a2", "a3")
     ]
+    gate.touch()
     for s in submits:
       self.wait_for_done(s["job_id"])
     self.assertEqual(seq.read_text().split(), ["a1", "a2", "a3"])
 
   def test_client_id_defaults_to_anon_and_is_visible(self):
-    blocker = self.submit("sleep 0.6", client="agent-x")
+    gate = Path(self.temp_dir.name) / "client_id_gate"
+    blocker = self.submit(self.gate_cmd(gate), client="agent-x")
     self.wait_for_running(blocker["job_id"])
     queued = self.submit(self.python_cmd("print('hi')"), client="agent-y")
     anon = self.submit(self.python_cmd("print('anon')"))
@@ -529,6 +542,7 @@ class QueueServerTest(QueueServerTestBase):
     self.assertEqual(clients[queued["job_id"]], "agent-y")
     self.assertEqual(clients[anon["job_id"]], "anon")
 
+    gate.touch()
     self.wait_for_done(queued["job_id"])
     self.wait_for_done(anon["job_id"])
 
@@ -552,7 +566,8 @@ class QueueServerTest(QueueServerTestBase):
 
   def test_cancel_queued_job(self):
     seq = Path(self.temp_dir.name) / "seq.txt"
-    blocker = self.submit("sleep 1")
+    gate = Path(self.temp_dir.name) / "cancel_gate"
+    blocker = self.submit(self.gate_cmd(gate))
     self.wait_for_running(blocker["job_id"])
     victim = self.submit(self.seq_cmd("victim", seq))
 
@@ -573,6 +588,7 @@ class QueueServerTest(QueueServerTestBase):
     logs = self.get_json(f"/logs/{victim['job_id']}?offset=0&limit=4096")
     self.assertIn("Cancelled while queued", logs["content"])
 
+    gate.touch()
     self.wait_for_done(blocker["job_id"])
     self.assertFalse(seq.exists(), "cancelled job must never run")
 
@@ -713,7 +729,7 @@ class DeviceHealthTest(QueueServerTestBase):
       return 0
 
   def test_concurrent_reset_requests_coalesce_into_one(self):
-    self.reset_sleep.write_text("1.0")
+    self.reset_sleep.write_text("0.1")
     job = self.submit(self.python_cmd("print('boom')"))
     self.wait_for_done(job["job_id"])
 
@@ -749,7 +765,7 @@ class DeviceHealthTest(QueueServerTestBase):
     self.assertEqual(code, 404)
 
   def test_queue_is_held_during_reset_then_resumes(self):
-    self.reset_sleep.write_text("0.8")
+    self.reset_sleep.write_text("0.1")
     job = self.submit(self.python_cmd("print('boom')"))
     self.wait_for_done(job["job_id"])
 
@@ -757,7 +773,7 @@ class DeviceHealthTest(QueueServerTestBase):
     self.assertEqual(resp["action"], "scheduled")
 
     held = self.submit(self.python_cmd("print('after-reset')"))
-    time.sleep(0.3)
+    time.sleep(POLL_INTERVAL)
     self.assertEqual(self.get_json(f"/job/{held['job_id']}")["status"], "queued")
 
     result = self.wait_for_done(held["job_id"])
@@ -801,7 +817,8 @@ class DeviceHealthTest(QueueServerTestBase):
     self.probe_rc.write_text("1")
     self.deep_rc.write_text("1")  # deep reset escalation fails too
 
-    blocker = self.submit("sleep 0.6", client="agent-a")
+    gate = Path(self.temp_dir.name) / "failed_reset_gate"
+    blocker = self.submit(self.gate_cmd(gate), client="agent-a")
     self.wait_for_running(blocker["job_id"])
     k1 = self.submit(self.python_cmd("print('k1')"), client="agent-a")
     k2 = self.submit(self.python_cmd("print('k2')"), client="agent-b")
@@ -812,6 +829,7 @@ class DeviceHealthTest(QueueServerTestBase):
     self.assertEqual(resp["breakage"]["suspect_job"]["id"], blocker["job_id"])
 
     # The running job is allowed to finish normally.
+    gate.touch()
     blocker_result = self.wait_for_done(blocker["job_id"])
     self.assertEqual(blocker_result["exit_code"], 0)
 

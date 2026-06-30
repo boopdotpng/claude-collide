@@ -61,6 +61,7 @@ DB_PATH = LOG_DIR / "jobs.sqlite3"
 DEFAULT_ITER_ESTIMATE_SEC = 10
 MAX_LOG_READ = 64 * 1024
 STOP_GRACE_SEC = 8
+PROCESS_POLL_INTERVAL = float(os.environ.get("TT_DEVICE_PROCESS_POLL_INTERVAL", "0.2"))
 DEFAULT_CHILD_OOM_SCORE_ADJ = "500"
 DEFAULT_CLIENT_ID = "anon"
 MAX_CLIENT_ID_LEN = 128
@@ -1133,7 +1134,7 @@ class DeviceQueue:
         if timeout_remaining <= 0:
           raise subprocess.TimeoutExpired(job.cmd, job.timeout)
 
-      poll_window = 0.2
+      poll_window = PROCESS_POLL_INTERVAL
       if timeout_remaining is not None:
         poll_window = min(poll_window, max(0.01, timeout_remaining))
 
