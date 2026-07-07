@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import json
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -10,9 +9,6 @@ from pathlib import Path
 
 class QueueClientError(Exception):
   pass
-
-
-DEFAULT_TT_SMI = Path("~/tenstorrent/blackhole-py/tt-smi.py").expanduser()
 
 
 def read_output_file(output_file: str) -> str:
@@ -78,21 +74,3 @@ def wait_for_job(base: str, job_id: str, poll_interval: float = 0.5) -> dict:
       }
     time.sleep(interval)
     interval = min(interval * 2, poll_interval)
-
-
-def run_tt_smi_snapshot(tt_smi: Path = DEFAULT_TT_SMI, device: int | None = None) -> str:
-  cmd = [str(tt_smi), "--snapshot"]
-  if device is not None:
-    cmd.append(str(device))
-
-  proc = subprocess.run(
-    cmd,
-    cwd=str(tt_smi.parent),
-    capture_output=True,
-    text=True,
-  )
-  output = proc.stdout.strip()
-  error = proc.stderr.strip()
-  if proc.returncode != 0:
-    raise QueueClientError(error or output or "tt-smi snapshot failed")
-  return output

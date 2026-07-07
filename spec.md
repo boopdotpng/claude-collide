@@ -14,7 +14,6 @@ It is intended to be the source of truth for feature scope and runtime semantics
 - Provide two user-facing surfaces:
   - an HTTP queue server in `server.py`
   - an MCP wrapper in `mcp_server.py`
-- Provide one direct non-queued power telemetry path via `tt-smi.py --snapshot`.
 
 ## Process Model
 
@@ -57,12 +56,13 @@ It is intended to be the source of truth for feature scope and runtime semantics
   otherwise the currently running non-reset job, otherwise the latest completed
   non-reset job. The record includes the command, client, output file, reset
   epoch, reporter, and reset job/result when known.
-- Reset procedure (worker thread): run `TT_DEVICE_RESET_CMD`, then verify with
-  `TT_DEVICE_PROBE_CMD`. On probe failure, retry up to `TT_DEVICE_RESET_RETRIES`
-  more times (default 1). Each reset run is recorded as a synthetic job with
-  `mode=reset` and `client_id=system`, visible in status/history/logs.
-- Probe success: epoch increments, state returns to `healthy`, queue resumes.
-- Probe failure after retries: state becomes `dead`:
+- Reset procedure (worker thread): run `TT_DEVICE_RESET_CMD`. If it exits
+  non-zero, retry up to `TT_DEVICE_RESET_RETRIES` more times (default 1). Each
+  reset run is recorded as a synthetic job with `mode=reset` and
+  `client_id=system`, visible in status/history/logs.
+- Reset command success: epoch increments, state returns to `healthy`, queue resumes.
+- Reset command failure after retries: state becomes `dead` after the deep reset
+  escalation also fails:
   - all queued jobs are failed with exit code `-1` and a
     `DEVICE UNRECOVERABLE ... host reboot is required` message appended to
     their logs (agents blocked on `result` receive it via the normal poll)
@@ -71,8 +71,8 @@ It is intended to be the source of truth for feature scope and runtime semantics
   - `/status` reports `device.state = "dead"` with `dead_since`/`dead_reason`
 - Dead state is in-memory only: a server restart (e.g. after host reboot)
   starts back at `healthy` with `reset_epoch = 0`.
-- Defaults for reset/probe commands come from `tt-smi.py` (`-r 0` and
-  `--snapshot`); both are overridable via environment for testing.
+- The default reset command is `~/tenstorrent/blackhole-py/reset.py -r`,
+  overridable via environment for testing.
 
 ## Job Model
 
@@ -284,7 +284,6 @@ Implemented tools in `mcp_server.py`:
 - `queue_python(script, cwd, repeat, python, args)`
 - `job(job_id)`
 - `logs(job_id, offset, limit)`
-- `tt_smi_status()`
 - `result(job_id)`
 - `status()`
 - `kill(job_id="")`
@@ -310,7 +309,6 @@ MCP behavior notes:
 - `queue_python` stores large one-off Python snippets as files before queueing,
   keeping queue metadata readable.
 - `result` waits until completion, then returns the full output text.
-- `tt_smi_status` does not use the queue and can run concurrently with queued jobs.
 - `reset` is not queued work and not a direct bypass path; it is a health
   report handled by the server's device state machine.
 - The deep-reset sudo helper refuses direct agent-shell invocation; it only
@@ -323,19 +321,8 @@ MCP behavior notes:
 - HTTP GET/POST with uniform error translation
 - blocking wait/poll loop for jobs
 - output-file reading for completed results
-- direct `~/tenstorrent/blackhole-py/tt-smi.py --snapshot` invocation
 
-This file keeps HTTP client behavior and direct telemetry invocation separate from MCP transport code.
-
-## TT-SMI Status
-
-The `tt_smi_status` path invokes the same `tt-smi.py` file used for reset:
-
-- command: `~/tenstorrent/blackhole-py/tt-smi.py --snapshot`
-- source: Blackhole PCIe telemetry as rendered by `tt-smi`
-- output includes the snapshot's thermals, power, clocks, status, and raw telemetry
-
-If no Blackhole PCIe device is found or telemetry fails, the command exits non-zero.
+This file keeps HTTP client behavior separate from MCP transport code.
 
 ## Installation and Service Behavior
 
@@ -368,7 +355,6 @@ Implemented tests cover:
   submissions and reset requests with HTTP 503, and recovery after restart
 - MCP payloads carrying `CLIENT_ID`, the report-style `reset` tool, `cancel`,
   and device banners in `status`
-- `tt_smi_status` snapshot invocation and error handling in `queue_client.py`
 
 ## Not Guaranteed by the Current Implementation
 

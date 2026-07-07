@@ -69,14 +69,14 @@ TENSTORRENT_KERNEL_MODULE = "tenstorrent"
 LSMOD_CMD = os.environ.get("TT_DEVICE_LSMOD_CMD", "/usr/bin/lsmod")
 QUEUE_DISABLED_MSG = "tenstorrent module loaded, blackhole-py will not work"
 
-TT_SMI_PATH = os.environ.get(
-  "TT_DEVICE_TT_SMI", os.path.expanduser("~/tenstorrent/blackhole-py/tt-smi.py")
+RESET_SCRIPT_PATH = os.environ.get(
+  "TT_DEVICE_RESET_SCRIPT",
+  os.path.expanduser("~/tenstorrent/blackhole-py/reset.py"),
 )
-RESET_CMD = os.environ.get("TT_DEVICE_RESET_CMD", f"{TT_SMI_PATH} -r 0")
-PROBE_CMD = os.environ.get("TT_DEVICE_PROBE_CMD", f"{TT_SMI_PATH} --snapshot")
+RESET_CMD = os.environ.get("TT_DEVICE_RESET_CMD", f"{RESET_SCRIPT_PATH} -r")
 RESET_RETRIES = int(os.environ.get("TT_DEVICE_RESET_RETRIES", "1"))
 HEALTH_CMD_TIMEOUT = int(os.environ.get("TT_DEVICE_HEALTH_CMD_TIMEOUT", "60"))
-# Escalation when tt-smi -r fails its probe: PCI remove + rescan via a
+# Escalation when the first-level reset command fails: PCI remove + rescan via a
 # root-owned helper allowed through /etc/sudoers.d/tt-device-queue (see
 # install-deep-reset.sh). `sudo -n` fails fast (no password prompt) if the
 # helper is not installed, in which case behaviour degrades to the old
@@ -94,8 +94,8 @@ if DEEP_RESET_CMD is None:
   ]
   DEEP_RESET_CMD = " ".join(shlex.quote(part) for part in DEEP_RESET_ARGV)
 REBOOT_REQUIRED_MSG = (
-  "DEVICE UNRECOVERABLE: neither a tt-smi reset nor a PCI remove/rescan "
-  "brought the device back (tt-smi probe failing). A host reboot is "
+  "DEVICE UNRECOVERABLE: neither first-level reset nor a PCI remove/rescan "
+  "brought the device back. A host reboot is "
   "required. All queued jobs were aborted — end your turn and do not "
   "submit further jobs."
 )
@@ -1191,7 +1191,7 @@ class DeviceQueue:
         self._cond.wait(timeout=1.0 if disabled_reason is not None else None)
 
   def _run_logged_command(self, job: Job, out_f, cmd: str | list[str], timeout: int) -> int:
-    """Run a health command (reset/probe), appending its output to the job log."""
+    """Run a health command, appending its output to the job log."""
     self._append_output(
       job, out_f, f"[tt-device-queue] $ {_command_display(cmd)}\n".encode()
     )
@@ -1242,7 +1242,7 @@ class DeviceQueue:
         self._store.save_job(job)
 
   def _execute_reset(self):
-    """Run the reset + probe sequence. Transitions to healthy or dead."""
+    """Run the reset sequence. Transitions to healthy or dead."""
     job_id = uuid.uuid4().hex[:8]
     output_dir = LOG_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1270,29 +1270,25 @@ class DeviceQueue:
             job, out_f,
             f"[tt-device-queue] Reset attempt {attempt}/{attempts}\n".encode(),
           )
-          self._run_logged_command(job, out_f, RESET_CMD, HEALTH_CMD_TIMEOUT)
-          probe_rc = self._run_logged_command(job, out_f, PROBE_CMD, HEALTH_CMD_TIMEOUT)
-          if probe_rc == 0:
+          reset_rc = self._run_logged_command(job, out_f, RESET_CMD, HEALTH_CMD_TIMEOUT)
+          if reset_rc == 0:
             healthy = True
             break
         if not healthy:
-          # Escalate: PCI remove + rescan (deeper than tt-smi -r), then one
-          # more tt-smi reset + probe. The worker thread is the only thing
-          # that calls this, so no job can be running on the device here.
+          # Escalate: PCI remove + rescan (deeper than first-level reset), then
+          # one more reset. The worker thread is the only thing that calls this,
+          # so no job can be running on the device here.
           self._append_output(
             job, out_f,
-            b"[tt-device-queue] tt-smi reset failed; escalating to PCI "
+            b"[tt-device-queue] first-level reset failed; escalating to PCI "
             b"remove/rescan\n",
           )
           deep_rc = self._run_logged_command(
             job, out_f, DEEP_RESET_ARGV or DEEP_RESET_CMD, HEALTH_CMD_TIMEOUT
           )
           if deep_rc == 0:
-            self._run_logged_command(job, out_f, RESET_CMD, HEALTH_CMD_TIMEOUT)
-            probe_rc = self._run_logged_command(
-              job, out_f, PROBE_CMD, HEALTH_CMD_TIMEOUT
-            )
-            if probe_rc == 0:
+            reset_rc = self._run_logged_command(job, out_f, RESET_CMD, HEALTH_CMD_TIMEOUT)
+            if reset_rc == 0:
               healthy = True
         if healthy:
           self._append_output(

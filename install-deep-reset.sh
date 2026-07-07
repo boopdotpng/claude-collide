@@ -45,4 +45,4 @@ echo "  sudo -n $HELPER_DST 2>&1 | head -1              # should be refused outs
 echo ""
 echo "The queue server picks this up automatically (no config needed) the next"
 echo "time the service restarts. It is only used as an escalation when the"
-echo "tt-smi -r reset fails its probe, and never while a job is running."
+echo "first-level reset command fails, and never while a job is running."

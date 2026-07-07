@@ -20,7 +20,6 @@ AI coding agents cannot use `flock` correctly. They forget the lock, release it 
 │   codex,    │                  │  queue         │             │            │
 │   opencode) │                  │  result        │             │  fair      │──► shared
 │             │                  │  status        │             │  worker    │    resource
-│             │                  │  tt_smi_status │             │            │
 └─────────────┘                  │  reset         │             └────────────┘
                                  └────────────────┘
 ```
@@ -41,7 +40,6 @@ device.
 | `queue_python(script, cwd, repeat, python, args)` | No | Write a Python snippet to a script file, then enqueue that script |
 | `job(job_id)` | No | Fetch structured per-job status, timestamps, repeat progress, and queue position |
 | `logs(job_id, offset, limit)` | No | Read current or persisted job output by byte offset without blocking |
-| `tt_smi_status()` | No | Print a one-shot `tt-smi --snapshot` telemetry view without consuming a queue slot |
 | `result(job_id)` | Yes | Wait for a job to finish, return full output |
 | `status()` | No | Show running, queued, and recent jobs |
 | `last_breakage()` | No | Show the last broken-device report, suspected job, output file, and reset log |
@@ -67,11 +65,11 @@ Each MCP server process generates a stable client id at startup (override with `
 
 `reset(job_id)` does not queue a reset command — it *reports* a broken device. The server coalesces reports using reset epochs: if the device was already reset since your failing job ran, you get `already_reset` (just resubmit); if a reset is pending or running, you get `joined`; otherwise one reset is `scheduled`. Twenty agents reporting the same breakage produce exactly one reset. Reset responses and `last_breakage()` include the reported job when provided, plus the server's suspected culprit: the reported job, otherwise the currently running non-reset job, otherwise the most recently completed non-reset job. That record includes the command, client, and output file.
 
-The reset runs between jobs (the current job finishes first), then the device is verified with `tt-smi --snapshot`. While resetting, the queue is held. If the probe still fails after a retry, the server escalates to a **deep reset**: a PCI remove + rescan (`echo 1 > /sys/bus/pci/devices/<BDF>/remove`, then `echo 1 > /sys/bus/pci/rescan`) via a root-owned helper, followed by one more `tt-smi -r` + probe. This recovers devices that have fallen off the bus, where a tt-smi-level reset can't reach them. Only if that also fails is the device declared **dead**: every queued job is failed with a `DEVICE UNRECOVERABLE … host reboot is required` message in its output (so agents blocked on `result` see it), new submissions get HTTP 503, and `status()` shows a dead-device banner. After the host reboots, the systemd service restart brings the queue back healthy.
+The reset runs between jobs (the current job finishes first). While resetting, the queue is held. The first-level reset command is `~/tenstorrent/blackhole-py/reset.py -r` by default, and its exit code decides whether the device recovered. If that command keeps failing after retries, the server escalates to a **deep reset**: a PCI remove + rescan (`echo 1 > /sys/bus/pci/devices/<BDF>/remove`, then `echo 1 > /sys/bus/pci/rescan`) via a root-owned helper, followed by one more `reset.py -r`. This recovers devices that have fallen off the bus, where a first-level reset can't reach them. Only if that also fails is the device declared **dead**: every queued job is failed with a `DEVICE UNRECOVERABLE … host reboot is required` message in its output (so agents blocked on `result` see it), new submissions get HTTP 503, and `status()` shows a dead-device banner. After the host reboots, the systemd service restart brings the queue back healthy.
 
 The deep reset needs root, but the service runs as your user — so it goes through `sudo -n /usr/local/sbin/tt-pci-deep-reset`, a fixed-path helper allowed by a single-line `/etc/sudoers.d/tt-device-queue` rule (no blanket sudo for the service). The helper also checks that sudo was spawned directly by the queue server's reset worker; direct agent-shell calls such as `sudo -n /usr/local/sbin/tt-pci-deep-reset` are refused before touching `/sys`. Install or refresh it with `sudo ./install-deep-reset.sh`. Until it's installed, `sudo -n` fails fast and behavior degrades to the old mark-dead path. Like the first-level reset, the deep reset only ever runs from the worker thread between jobs — never while a job is on the device.
 
-Reset/probe commands and retry count are configurable via `TT_DEVICE_RESET_CMD`, `TT_DEVICE_PROBE_CMD`, and `TT_DEVICE_RESET_RETRIES`; the escalation via `TT_DEVICE_PCI_BDF` (default `0000:01:00.0`) and `TT_DEVICE_DEEP_RESET_CMD`.
+Reset command and retry count are configurable via `TT_DEVICE_RESET_CMD` and `TT_DEVICE_RESET_RETRIES`; the escalation via `TT_DEVICE_PCI_BDF` (default `0000:01:00.0`) and `TT_DEVICE_DEEP_RESET_CMD`.
 
 ## Setup
 

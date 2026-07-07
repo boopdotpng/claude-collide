@@ -12,7 +12,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from queue_client import post, get, run_tt_smi_snapshot, wait_for_job
+from queue_client import post, get, wait_for_job
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TT_DEVICE_PORT", "5741"))
@@ -126,12 +126,6 @@ async def logs(job_id: str, offset: int = 0, limit: int = 16384) -> str:
     result = await _get(f"/logs/{job_id}?offset={offset}&limit={limit}")
 
     return json.dumps(result, indent=2)
-
-
-@server.tool(name="tt_smi_status")
-async def tt_smi_status() -> str:
-    """Run tt-smi snapshot outside the queue."""
-    return await asyncio.to_thread(run_tt_smi_snapshot)
 
 
 def _breakage_lines(breakage: dict | None) -> list[str]:

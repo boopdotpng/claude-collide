@@ -674,8 +674,8 @@ class DeviceHealthTest(QueueServerTestBase):
   def extra_server_env(self) -> dict:
     base = Path(self.temp_dir.name)
     self.reset_count = base / "reset_count"
+    self.reset_rc = base / "reset_rc"
     self.reset_sleep = base / "reset_sleep"
-    self.probe_rc = base / "probe_rc"
 
     reset_sh = base / "fake_reset.sh"
     reset_sh.write_text(
@@ -684,15 +684,10 @@ class DeviceHealthTest(QueueServerTestBase):
       f"echo $((count + 1)) > {self.reset_count}\n"
       f"sleep $(cat {self.reset_sleep} 2>/dev/null || echo 0)\n"
       "echo reset-done\n"
+      f"exit $(cat {self.reset_rc} 2>/dev/null || echo 0)\n"
     )
-    probe_sh = base / "fake_probe.sh"
-    probe_sh.write_text(
-      "#!/bin/sh\n"
-      "echo probe\n"
-      f"exit $(cat {self.probe_rc} 2>/dev/null || echo 0)\n"
-    )
-    # Fake deep reset (PCI remove/rescan stand-in): on success it "fixes" the
-    # device by clearing probe_rc; deep_rc simulates the helper failing.
+    # Fake deep reset (PCI remove/rescan stand-in): on success it lets the
+    # next first-level reset succeed; deep_rc simulates the helper failing.
     self.deep_count = base / "deep_count"
     self.deep_rc = base / "deep_rc"
     deep_sh = base / "fake_deep_reset.sh"
@@ -702,16 +697,14 @@ class DeviceHealthTest(QueueServerTestBase):
       f"echo $((count + 1)) > {self.deep_count}\n"
       f"rc=$(cat {self.deep_rc} 2>/dev/null || echo 0)\n"
       "[ \"$rc\" -ne 0 ] && exit \"$rc\"\n"
-      f"echo 0 > {self.probe_rc}\n"
+      f"echo 0 > {self.reset_rc}\n"
       "echo deep-reset-done\n"
     )
     reset_sh.chmod(0o755)
-    probe_sh.chmod(0o755)
     deep_sh.chmod(0o755)
 
     return {
       "TT_DEVICE_RESET_CMD": str(reset_sh),
-      "TT_DEVICE_PROBE_CMD": str(probe_sh),
       "TT_DEVICE_DEEP_RESET_CMD": str(deep_sh),
       "TT_DEVICE_RESET_RETRIES": "0",
     }
@@ -795,9 +788,9 @@ class DeviceHealthTest(QueueServerTestBase):
     self.assertEqual(resp["action"], "scheduled")
     self.wait_for_device("healthy", epoch=2)
 
-  def test_deep_reset_recovers_device_when_tt_smi_reset_fails(self):
-    # Probe keeps failing until the deep reset (PCI remove/rescan) "fixes" it.
-    self.probe_rc.write_text("1")
+  def test_deep_reset_recovers_device_when_first_level_reset_fails(self):
+    # First-level reset fails until the deep reset (PCI remove/rescan) "fixes" it.
+    self.reset_rc.write_text("1")
     job = self.submit(self.python_cmd("print('boom')"))
     self.wait_for_done(job["job_id"])
 
@@ -806,7 +799,7 @@ class DeviceHealthTest(QueueServerTestBase):
 
     device = self.wait_for_device("healthy", epoch=1)
     self.assertEqual(self.deep_reset_runs(), 1)
-    # tt-smi reset ran once before escalation and once after the deep reset.
+    # First-level reset ran once before escalation and once after the deep reset.
     self.assertEqual(self.reset_runs(), 2)
 
     after = self.submit(self.python_cmd("print('recovered')"))
@@ -814,7 +807,7 @@ class DeviceHealthTest(QueueServerTestBase):
     self.assertEqual(result["exit_code"], 0)
 
   def test_failed_reset_marks_device_dead_drains_queue_and_blocks_submits(self):
-    self.probe_rc.write_text("1")
+    self.reset_rc.write_text("1")
     self.deep_rc.write_text("1")  # deep reset escalation fails too
 
     gate = Path(self.temp_dir.name) / "failed_reset_gate"
@@ -857,7 +850,7 @@ class DeviceHealthTest(QueueServerTestBase):
     self.assertEqual(code, 503)
 
   def test_restart_recovers_from_dead_state(self):
-    self.probe_rc.write_text("1")
+    self.reset_rc.write_text("1")
     self.deep_rc.write_text("1")  # deep reset escalation fails too
     job = self.submit(self.python_cmd("print('boom')"))
     self.wait_for_done(job["job_id"])
