@@ -65,11 +65,9 @@ DEFAULT_CHILD_OOM_SCORE_ADJ = "500"
 DEFAULT_CLIENT_ID = "anon"
 MAX_CLIENT_ID_LEN = 128
 
-RESET_SCRIPT_PATH = os.environ.get(
-  "TT_DEVICE_RESET_SCRIPT",
-  os.path.expanduser("~/tenstorrent/blackhole-py/reset.py"),
-)
-RESET_CMD = os.environ.get("TT_DEVICE_RESET_CMD", f"{RESET_SCRIPT_PATH} -r")
+TT_SMI_PATH = os.path.expanduser("~/tenstorrent/.venv/bin/tt-smi")
+DEFAULT_RESET_CMD = f"{TT_SMI_PATH} -r"
+RESET_CMD = os.environ.get("TT_DEVICE_RESET_CMD", DEFAULT_RESET_CMD)
 RESET_RETRIES = int(os.environ.get("TT_DEVICE_RESET_RETRIES", "1"))
 HEALTH_CMD_TIMEOUT = int(os.environ.get("TT_DEVICE_HEALTH_CMD_TIMEOUT", "60"))
 # Escalation when the first-level reset command fails: PCI remove + rescan via a
@@ -92,8 +90,7 @@ if DEEP_RESET_CMD is None:
 REBOOT_REQUIRED_MSG = (
   "DEVICE UNRECOVERABLE: neither first-level reset nor a PCI remove/rescan "
   "brought the device back. A host reboot is "
-  "required. All queued jobs were aborted — end your turn and do not "
-  "submit further jobs."
+  "required. All queued jobs were aborted."
 )
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)

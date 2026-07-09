@@ -72,7 +72,7 @@ It is intended to be the source of truth for feature scope and runtime semantics
   - `/status` reports `device.state = "dead"` with `dead_since`/`dead_reason`
 - Dead state is in-memory only: a server restart (e.g. after host reboot)
   starts back at `healthy` with `reset_epoch = 0`.
-- The default reset command is `~/tenstorrent/blackhole-py/reset.py -r`,
+- The default reset command is `~/tenstorrent/.venv/bin/tt-smi -r`,
   overridable via environment for testing.
 
 ## Job Model
