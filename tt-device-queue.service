@@ -13,7 +13,6 @@ LimitNOFILE=65536
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
 # Unbuffered stdout so job lines reach the journal promptly
 Environment=PYTHONUNBUFFERED=1
-Environment=TT_DEVICE_LSMOD_CMD=/usr/bin/lsmod
 
 [Install]
 WantedBy=default.target

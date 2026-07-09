@@ -65,9 +65,6 @@ PROCESS_POLL_INTERVAL = float(os.environ.get("TT_DEVICE_PROCESS_POLL_INTERVAL", 
 DEFAULT_CHILD_OOM_SCORE_ADJ = "500"
 DEFAULT_CLIENT_ID = "anon"
 MAX_CLIENT_ID_LEN = 128
-TENSTORRENT_KERNEL_MODULE = "tenstorrent"
-LSMOD_CMD = os.environ.get("TT_DEVICE_LSMOD_CMD", "/usr/bin/lsmod")
-QUEUE_DISABLED_MSG = "tenstorrent module loaded, blackhole-py will not work"
 
 RESET_SCRIPT_PATH = os.environ.get(
   "TT_DEVICE_RESET_SCRIPT",
@@ -160,31 +157,6 @@ def _format_timestamp(ts: float | None) -> str | None:
 
 class DeviceDeadError(RuntimeError):
   """Raised when the device is dead and a host reboot is required."""
-
-
-class QueueDisabledError(RuntimeError):
-  """Raised when the queue should not accept or run device jobs."""
-
-
-def _tenstorrent_kernel_module_loaded() -> bool:
-  try:
-    proc = subprocess.run(
-      shlex.split(LSMOD_CMD),
-      stdout=subprocess.PIPE,
-      stderr=subprocess.DEVNULL,
-      text=True,
-      timeout=2,
-      check=False,
-    )
-  except (OSError, subprocess.TimeoutExpired, ValueError):
-    return False
-  return any(TENSTORRENT_KERNEL_MODULE in line for line in proc.stdout.splitlines())
-
-
-def _queue_disabled_reason() -> str | None:
-  if _tenstorrent_kernel_module_loaded():
-    return QUEUE_DISABLED_MSG
-  return None
 
 
 def _run_timeout(value) -> int:
@@ -656,9 +628,6 @@ class DeviceQueue:
   ) -> tuple["Job", int, int]:
     """Submit a job. Returns (job, position, estimated_wait_sec) computed atomically."""
     _validate_job_command(cmd)
-    disabled_reason = _queue_disabled_reason()
-    if disabled_reason is not None:
-      raise QueueDisabledError(disabled_reason)
     timeout = _run_timeout(timeout)
     if repeat < 1:
       raise ValueError("repeat must be >= 1")
@@ -692,9 +661,6 @@ class DeviceQueue:
     )
 
     with self._cond:
-      disabled_reason = _queue_disabled_reason()
-      if disabled_reason is not None:
-        raise QueueDisabledError(disabled_reason)
       if self._device_state == "dead":
         raise DeviceDeadError(self._dead_reason or REBOOT_REQUIRED_MSG)
       job.reset_epoch = self._reset_epoch
@@ -860,11 +826,10 @@ class DeviceQueue:
       return sum(len(q) for q in self._pending.values())
 
   def _device_status_locked(self) -> dict:
-    disabled_reason = _queue_disabled_reason()
     return {
-      "state": "disabled" if disabled_reason else self._device_state,
-      "queue_disabled": disabled_reason is not None,
-      "disabled_reason": disabled_reason,
+      "state": self._device_state,
+      "queue_disabled": False,
+      "disabled_reason": None,
       "reset_epoch": self._reset_epoch,
       "reset_pending": self._reset_pending,
       "last_reset_at": _format_timestamp(self._last_reset_at),
@@ -1178,8 +1143,7 @@ class DeviceQueue:
           self._reset_pending = False
           self._device_state = "resetting"
           return "reset", None
-        disabled_reason = _queue_disabled_reason()
-        if self._device_state == "healthy" and disabled_reason is None:
+        if self._device_state == "healthy":
           job = self._pick_job_locked()
           if job is not None:
             job.status = "running"
@@ -1188,7 +1152,7 @@ class DeviceQueue:
             self._current = job
             self._store.save_job(job)
             return "job", job
-        self._cond.wait(timeout=1.0 if disabled_reason is not None else None)
+        self._cond.wait()
 
   def _run_logged_command(self, job: Job, out_f, cmd: str | list[str], timeout: int) -> int:
     """Run a health command, appending its output to the job log."""
@@ -1668,9 +1632,6 @@ class Handler(BaseHTTPRequestHandler):
           env=body.get("env", {}),
           client_id=body.get("client_id", DEFAULT_CLIENT_ID),
         )
-      except QueueDisabledError as exc:
-        self._json_response(503, {"error": str(exc), "device_state": "disabled"})
-        return
       except DeviceDeadError as exc:
         self._json_response(503, {"error": str(exc), "device_state": "dead"})
         return

@@ -33,9 +33,6 @@ class QueueServerTestBase(unittest.TestCase):
     self.server_env["TT_DEVICE_PORT"] = str(self.port)
     self.server_env["TT_DEVICE_LOG_DIR"] = self.temp_dir.name
     self.server_env["TT_DEVICE_PROCESS_POLL_INTERVAL"] = "0.02"
-    self.lsmod_output = Path(self.temp_dir.name) / "lsmod.out"
-    self.lsmod_output.write_text("")
-    self.server_env["TT_DEVICE_LSMOD_CMD"] = f"/bin/cat {self.lsmod_output}"
     self.server_env.pop("PYTHONPATH", None)
     self.server_env.update(self.extra_server_env())
     self._start_server()
@@ -599,24 +596,6 @@ class QueueServerTest(QueueServerTestBase):
     self.assertIsNone(device["disabled_reason"])
     self.assertEqual(device["reset_epoch"], 0)
     self.assertFalse(device["reset_pending"])
-
-  def test_tenstorrent_kernel_module_disables_queue(self):
-    self.lsmod_output.write_text("tenstorrent 16384 0\n")
-
-    code, resp = self.post_status("/queue", {
-      "cmd": "true", "cwd": "", "timeout": 5,
-    })
-    self.assertEqual(code, 503)
-    self.assertEqual(resp["error"], "tenstorrent module loaded, blackhole-py will not work")
-    self.assertEqual(resp["device_state"], "disabled")
-
-    device = self.get_json("/status")["device"]
-    self.assertEqual(device["state"], "disabled")
-    self.assertTrue(device["queue_disabled"])
-    self.assertEqual(
-      device["disabled_reason"],
-      "tenstorrent module loaded, blackhole-py will not work",
-    )
 
   def test_migrates_legacy_db_without_client_columns(self):
     self._stop_server()
