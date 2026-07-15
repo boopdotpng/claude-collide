@@ -1,8 +1,6 @@
 # Agent Notes
 
-- Keep changes small and avoid rewriting unrelated dirty files.
-- Run focused tests first: `.venv/bin/python3 tests/test_queue_server.py`.
-- Run the full suite with the repo venv: `PYTHONPATH=. .venv/bin/python3 -m unittest discover -s tests -p 'test_*.py'`.
-- `python -m unittest tests.test_*` does not work because `tests/` is not a package.
-- If `tt-device-queue.service` or `server.py` changes and the user service is installed, refresh and restart it:
-  `cp tt-device-queue.service ~/.config/systemd/user/tt-device-queue.service && systemctl --user daemon-reload && systemctl --user restart tt-device-queue`.
+- Run focused server tests with `PYTHONPATH=. .venv/bin/python3 tests/test_queue_server.py`.
+- Run all tests with `PYTHONPATH=. .venv/bin/python3 -m unittest discover -s tests -p 'test_*.py'`.
+- Run the isolated stress test with `PYTHONPATH=. .venv/bin/python3 tests/stress_queue.py`.
+- After changing `server.py`, `queue_core.py`, or the unit, reinstall and restart it with `./install.sh` only after confirming the queue is idle.

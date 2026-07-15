@@ -1,11 +1,5 @@
 .venv/
 __pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-/tmp/
-/logs/
-*.egg-info/
+*.py[cod]
+logs/
+logs-v2/

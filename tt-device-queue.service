@@ -1,18 +1,21 @@
 [Unit]
-Description=Tenstorrent device queue — serializes hardware access
+Description=Tenstorrent device queue - durable serialized hardware access
 After=network.target
 
 [Service]
 Type=simple
+WorkingDirectory=%h
 ExecStart=%h/tenstorrent/tt-device-queue/.venv/bin/python3 %h/tenstorrent/tt-device-queue/server.py
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=20
+KillMode=control-group
 OOMPolicy=continue
-# Soft default of 1024 caused EMFILE ("Too many open files") on 2026-06-10
 LimitNOFILE=65536
+NoNewPrivileges=yes
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
-# Unbuffered stdout so job lines reach the journal promptly
 Environment=PYTHONUNBUFFERED=1
+Environment=TT_DEVICE_LOG_DIR=%h/tenstorrent/tt-device-queue/logs-v2
 
 [Install]
 WantedBy=default.target
