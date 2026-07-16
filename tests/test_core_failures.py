@@ -8,7 +8,14 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from queue_core import DeviceQueue, DeviceState, JobStore, QueueConfig, QueueUnavailable
+from queue_core import (
+    CURRENT_SCHEMA_VERSION,
+    DeviceQueue,
+    DeviceState,
+    JobStore,
+    QueueConfig,
+    QueueUnavailable,
+)
 
 
 class CoreFailureTest(unittest.TestCase):
@@ -138,6 +145,41 @@ class CoreFailureTest(unittest.TestCase):
         self.assertEqual(result.error, "simulated unrecoverable device")
         self.assertEqual(recovered.status()["pending"], [])
         self.assertIn("simulated unrecoverable device", Path(result.output_file).read_text())
+
+    def test_v1_device_state_is_rebuilt_to_current_schema(self) -> None:
+        path = Path(self.temp.name) / "migration" / "jobs.sqlite3"
+        path.parent.mkdir()
+        connection = sqlite3.connect(path)
+        connection.execute("""
+            CREATE TABLE device_state (
+                singleton INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                reset_epoch INTEGER NOT NULL,
+                reset_pending INTEGER NOT NULL,
+                boot_id TEXT NOT NULL,
+                last_reset_at REAL,
+                dead_since REAL,
+                dead_reason TEXT,
+                legacy_payload TEXT,
+                updated_at REAL NOT NULL
+            )
+        """)
+        connection.execute(
+            "INSERT INTO device_state VALUES (1, 'dead', 4, 0, 'boot', NULL, 2.0, 'reason', 'old', 3.0)"
+        )
+        connection.execute("PRAGMA user_version=1")
+        connection.commit()
+        connection.close()
+
+        store = JobStore(path)
+        state = store.load_device_state()
+        self.assertEqual(state.state, "dead")
+        self.assertEqual(state.reset_epoch, 4)
+        with sqlite3.connect(path) as connection:
+            columns = [row[1] for row in connection.execute("PRAGMA table_info(device_state)")]
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        self.assertNotIn("legacy_payload", columns)
+        self.assertEqual(version, CURRENT_SCHEMA_VERSION)
 
     def test_incompatible_original_database_is_rejected(self) -> None:
         path = Path(self.temp.name) / "legacy" / "jobs.sqlite3"

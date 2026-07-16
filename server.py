@@ -136,11 +136,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/status":
             self._send_json(200, self.queue.status())
             return
-        if path == "/breakage":
-            self._send_json(200, {
-                "last_breakage": self.queue.status()["device"].get("last_breakage")
-            })
-            return
         if path.startswith("/job/"):
             job_id = self._job_id_from(path, "/job/")
             job = self.queue.get_job(job_id)
@@ -227,27 +222,6 @@ class Handler(BaseHTTPRequestHandler):
                 "repeat": job.repeat, "mode": job.mode, "timeout": job.timeout,
             })
             return
-        if path == "/cancel":
-            body = self._read_json()
-            if body is None:
-                return
-            job_id = body.get("job_id")
-            if not isinstance(job_id, str) or not job_id.strip():
-                self._send_json(400, {"error": "Missing 'job_id'"})
-                return
-            try:
-                cancelled = self.queue.cancel_job(job_id.strip())
-            except KeyError:
-                self._send_json(404, {"error": f"Unknown job: {job_id}"})
-                return
-            except ValueError as exc:
-                self._send_json(409, {"error": str(exc)})
-                return
-            except QueueUnavailable as exc:
-                self._send_json(503, {"error": str(exc)})
-                return
-            self._send_json(200, {"cancelled": cancelled})
-            return
         if path == "/kill":
             body = self._read_json()
             if body is None:
@@ -272,10 +246,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "job_id must be a string"})
                 return
             try:
-                result = self.queue.request_reset(
-                    raw_job_id.strip() or None,
-                    body.get("client_id", DEFAULT_CLIENT_ID),
-                )
+                result = self.queue.request_reset(raw_job_id.strip() or None)
             except KeyError:
                 self._send_json(404, {"error": f"Unknown job: {raw_job_id}"})
                 return

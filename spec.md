@@ -56,8 +56,7 @@ work.
 
 ## Compatibility additions
 
-Existing HTTP endpoints remain. The MCP surface omits the redundant
-`last_breakage` tool and queued-job `cancel` tool. New response fields include:
+The queue exposes bounded status, log, and result data. Response fields include:
 
 - `/status.worker.alive`, `heartbeat_age_sec`, `degraded_reason`, and
   `maintenance_warning`

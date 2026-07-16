@@ -169,21 +169,6 @@ async def result(job_id: str) -> str:
     return "\n".join(lines)
 
 
-def _breakage_lines(breakage: dict | None) -> list[str]:
-    if not breakage:
-        return []
-    lines = ["LAST BREAKAGE REPORT:"]
-    suspect = breakage.get("suspect_job") or {}
-    if suspect:
-        lines.append(f"  suspect [{suspect.get('id')}] ({suspect.get('client')}) {suspect.get('cmd')}")
-        if suspect.get("output_file"):
-            lines.append(f"  output {suspect['output_file']}")
-    reset_job = breakage.get("reset_job") or {}
-    if reset_job:
-        lines.append(f"  reset [{reset_job.get('id')}] {breakage.get('reset_result', 'running')}")
-    return lines
-
-
 @server.tool(name="status")
 async def status() -> str:
     """Show queue and device status."""
@@ -195,10 +180,8 @@ async def status() -> str:
     device = data.get("device") or {}
     if device.get("state") == "dead":
         lines.append(f"!!! DEVICE DEAD since {device.get('dead_since')} — {device.get('dead_reason')}")
-        lines.extend(_breakage_lines(device.get("last_breakage")))
     elif device.get("state") == "resetting" or device.get("reset_pending"):
         lines.append("!!! DEVICE RESET in progress — jobs are held")
-        lines.extend(_breakage_lines(device.get("last_breakage")))
     current = data.get("current")
     if current:
         client = f" ({current['client']})" if current.get("client") else ""
@@ -237,11 +220,8 @@ async def kill(job_id: str = "") -> str:
 
 @server.tool(name="reset")
 async def reset(job_id: str = "") -> str:
-    """Report device breakage and schedule a coalesced reset."""
-    payload = {"client_id": CLIENT_ID}
-    if job_id:
-        payload["job_id"] = job_id
-    return json.dumps(await _post("/reset", payload), indent=2)
+    """Schedule a coalesced device reset."""
+    return json.dumps(await _post("/reset", {"job_id": job_id} if job_id else {}), indent=2)
 
 
 if __name__ == "__main__":

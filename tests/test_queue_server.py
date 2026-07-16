@@ -168,7 +168,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(result["exit_code"], -9)
         self.assertLess(result["elapsed"], 3)
 
-    def test_round_robin_and_cancel(self) -> None:
+    def test_round_robin(self) -> None:
         gate = Path(self.temp.name) / "gate"
         sequence = Path(self.temp.name) / "sequence"
         blocker = self.submit(
@@ -184,11 +184,8 @@ class ServerTest(unittest.TestCase):
             )
 
         a1, a2, b1 = marker("a1", "a"), marker("a2", "a"), marker("b1", "b")
-        victim = marker("victim", "c")
-        cancelled = self.post("/cancel", {"job_id": victim["job_id"]})
-        self.assertEqual(cancelled["cancelled"]["id"], victim["job_id"])
         gate.touch()
-        for item in (blocker, a1, a2, b1, victim):
+        for item in (blocker, a1, a2, b1):
             self.wait_done(item["job_id"])
         self.assertEqual(sequence.read_text().split(), ["a1", "b1", "a2"])
 
@@ -295,12 +292,6 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("must-not-run", queued_logs["content"])
         self.assertIn("reboot or operator recovery", queued_logs["content"])
 
-        breakage = self.get("/breakage")["last_breakage"]
-        self.assertEqual(breakage["reported_job"]["id"], failed["job_id"])
-        self.assertEqual(breakage["suspect_job"]["id"], failed["job_id"])
-        self.assertEqual(breakage["reported_by"], "simulated-device-test")
-        self.assertEqual(breakage["reset_result"], "dead")
-
         self.stop()
         self.start()
         self.assertEqual(self.get("/status")["device"]["state"], "dead")
@@ -351,7 +342,6 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(len(reset_count.read_text().splitlines()), 3)
         self.assertEqual(len(deep_count.read_text().splitlines()), 1)
         self.assertEqual(len(health_count.read_text().splitlines()), 1)
-        self.assertEqual(self.get("/breakage")["last_breakage"]["reset_result"], "healthy")
 
     def test_dead_state_survives_same_boot_restart(self) -> None:
         self.env["TT_DEVICE_RESET_CMD"] = "/bin/false"

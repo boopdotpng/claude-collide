@@ -24,6 +24,7 @@ from typing import Any, Iterator
 
 
 DEFAULT_CLIENT_ID = "anon"
+CURRENT_SCHEMA_VERSION = 2
 MAX_CLIENT_ID_LEN = 128
 DEFAULT_ITER_ESTIMATE_SEC = 10.0
 STOP_GRACE_SEC = 8.0
@@ -173,7 +174,6 @@ class DeviceState:
     last_reset_at: float | None = None
     dead_since: float | None = None
     dead_reason: str | None = None
-    last_breakage: dict[str, Any] | None = None
 
 
 class QueueUnavailable(RuntimeError):
@@ -208,12 +208,28 @@ class JobStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def _create_device_state_table(conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS device_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                state TEXT NOT NULL,
+                reset_epoch INTEGER NOT NULL,
+                reset_pending INTEGER NOT NULL,
+                boot_id TEXT NOT NULL,
+                last_reset_at REAL,
+                dead_since REAL,
+                dead_reason TEXT,
+                updated_at REAL NOT NULL
+            )
+        """)
+
     def _initialize(self) -> None:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version > 1:
+            if version > CURRENT_SCHEMA_VERSION:
                 raise RuntimeError(f"database schema version {version} is newer than this server")
             existing_jobs = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
@@ -261,27 +277,27 @@ class JobStore:
                     updated_at REAL NOT NULL
                 )
             """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS device_state (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    state TEXT NOT NULL,
-                    reset_epoch INTEGER NOT NULL,
-                    reset_pending INTEGER NOT NULL,
-                    boot_id TEXT NOT NULL,
-                    last_reset_at REAL,
-                    dead_since REAL,
-                    dead_reason TEXT,
-                    last_breakage_json TEXT,
-                    updated_at REAL NOT NULL
+            self._create_device_state_table(conn)
+            if version == 1:
+                columns = (
+                    "singleton", "state", "reset_epoch", "reset_pending", "boot_id",
+                    "last_reset_at", "dead_since", "dead_reason", "updated_at",
                 )
-            """)
+                projection = ", ".join(columns)
+                conn.execute("ALTER TABLE device_state RENAME TO device_state_v1")
+                self._create_device_state_table(conn)
+                conn.execute(
+                    f"INSERT INTO device_state ({projection}) "
+                    f"SELECT {projection} FROM device_state_v1"
+                )
+                conn.execute("DROP TABLE device_state_v1")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_seq ON jobs(status, seq)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_finished ON jobs(finished_at DESC)"
             )
-            conn.execute("PRAGMA user_version=1")
+            conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
 
     @staticmethod
     def _values(job: Job) -> tuple[Any, ...]:
@@ -373,15 +389,6 @@ class JobStore:
             })
         return result
 
-    def latest_completed_device_job(self) -> Job | None:
-        with self.connect() as conn:
-            row = conn.execute("""
-                SELECT * FROM jobs
-                WHERE status='done' AND mode != 'reset'
-                ORDER BY finished_at DESC, seq DESC LIMIT 1
-            """).fetchone()
-        return self._row_to_job(row) if row else None
-
     def load_device_state(self) -> DeviceState | None:
         with self.connect() as conn:
             row = conn.execute(
@@ -389,15 +396,11 @@ class JobStore:
             ).fetchone()
         if not row:
             return None
-        try:
-            breakage = json.loads(row["last_breakage_json"]) if row["last_breakage_json"] else None
-        except json.JSONDecodeError:
-            breakage = None
         return DeviceState(
             state=row["state"], reset_epoch=row["reset_epoch"],
             reset_pending=bool(row["reset_pending"]), boot_id=row["boot_id"],
             last_reset_at=row["last_reset_at"], dead_since=row["dead_since"],
-            dead_reason=row["dead_reason"], last_breakage=breakage,
+            dead_reason=row["dead_reason"],
         )
 
     def save_device_state(self, state: DeviceState) -> None:
@@ -405,20 +408,16 @@ class JobStore:
             conn.execute("""
                 INSERT INTO device_state (
                     singleton, state, reset_epoch, reset_pending, boot_id,
-                    last_reset_at, dead_since, dead_reason, last_breakage_json, updated_at
-                ) VALUES (1,?,?,?,?,?,?,?,?,?)
+                    last_reset_at, dead_since, dead_reason, updated_at
+                ) VALUES (1,?,?,?,?,?,?,?,?)
                 ON CONFLICT(singleton) DO UPDATE SET
                     state=excluded.state, reset_epoch=excluded.reset_epoch,
                     reset_pending=excluded.reset_pending, boot_id=excluded.boot_id,
                     last_reset_at=excluded.last_reset_at, dead_since=excluded.dead_since,
-                    dead_reason=excluded.dead_reason,
-                    last_breakage_json=excluded.last_breakage_json,
-                    updated_at=excluded.updated_at
+                    dead_reason=excluded.dead_reason, updated_at=excluded.updated_at
             """, (
                 state.state, state.reset_epoch, int(state.reset_pending), state.boot_id,
-                state.last_reset_at, state.dead_since, state.dead_reason,
-                json.dumps(state.last_breakage, sort_keys=True) if state.last_breakage else None,
-                time.time(),
+                state.last_reset_at, state.dead_since, state.dead_reason, time.time(),
             ))
 
     def prune_completed(self, cutoff: float, keep: int) -> list[str]:
@@ -534,7 +533,6 @@ class DeviceQueue:
             state = DeviceState(
                 state="healthy", reset_epoch=state.reset_epoch + 1,
                 boot_id=boot, last_reset_at=state.last_reset_at,
-                last_breakage=state.last_breakage,
             )
             self.store.save_device_state(state)
         elif state.state == "resetting":
@@ -949,43 +947,6 @@ class DeviceQueue:
             "dropped_log_bytes": job.dropped_log_bytes,
         }
 
-    def cancel_job(self, job_id: str) -> dict[str, Any]:
-        with self._cond:
-            job = self._jobs.get(job_id)
-            if not job:
-                stored = self.store.load_job(job_id)
-                if not stored:
-                    raise KeyError(job_id)
-                raise ValueError(f"Job {job_id} is not queued")
-            if job.status != "queued":
-                raise ValueError(f"Job {job_id} is not queued (status: {job.status})")
-            queue = self._pending.get(job.client_id)
-            if not queue or job_id not in queue:
-                raise ValueError(f"Job {job_id} is no longer queued")
-            previous = (job.status, job.exit_code, job.finished_at, job.error)
-            job.status = "done"
-            job.exit_code = -1
-            job.finished_at = time.time()
-            job.error = "cancelled while queued"
-            try:
-                self.store.update_job(job)
-            except Exception as exc:
-                job.status, job.exit_code, job.finished_at, job.error = previous
-                raise QueueUnavailable(
-                    f"could not persist cancellation: {type(exc).__name__}: {exc}"
-                ) from exc
-            queue.remove(job_id)
-            self._jobs.pop(job.id, None)
-            self._cond.notify_all()
-        try:
-            with open(job.output_file, "ab") as stream:
-                stream.write(b"[tt-device-queue] Cancelled while queued\n")
-            job.log_size = Path(job.output_file).stat().st_size
-            self._persist_job(job)
-        except OSError:
-            pass
-        return {"id": job.id, "cmd": job.cmd[:120], "client": job.client_id}
-
     def stop_job(self, job_id: str | None = None) -> dict[str, Any] | None:
         with self._lock:
             job, proc = self._current, self._current_proc
@@ -1000,10 +961,7 @@ class DeviceQueue:
         self._signal_group(proc, signal.SIGINT)
         return info
 
-    def request_reset(self, job_id: str | None, client_id: Any) -> dict[str, Any]:
-        if not isinstance(client_id, str) or not client_id.strip():
-            client_id = DEFAULT_CLIENT_ID
-        client_id = client_id.strip()[:MAX_CLIENT_ID_LEN]
+    def request_reset(self, job_id: str | None) -> dict[str, Any]:
         reported = self.get_job(job_id) if job_id else None
         if job_id and reported is None:
             raise KeyError(job_id)
@@ -1020,21 +978,10 @@ class DeviceQueue:
             if self._state.state == "resetting" or self._state.reset_pending:
                 return {
                     "action": "joined", "device_state": self._state.state,
-                    "reset_epoch": epoch, "breakage": self._state.last_breakage,
+                    "reset_epoch": epoch,
                     "hint": "A reset is already pending or in progress.",
                 }
-            suspect = reported
-            if suspect is None and self._current and self._current.mode == "run":
-                suspect = self._current
-            if suspect is None:
-                suspect = self.store.latest_completed_device_job()
-            breakage = {
-                "reported_at": format_timestamp(time.time()), "reported_by": client_id,
-                "reset_epoch": epoch, "action": "scheduled",
-                "reported_job": self._job_ref(reported), "suspect_job": self._job_ref(suspect),
-            }
             self._state.reset_pending = True
-            self._state.last_breakage = breakage
             if not self._persist_state():
                 raise QueueUnavailable(self._degraded_reason or "failed to persist reset request")
             if (
@@ -1050,21 +997,8 @@ class DeviceQueue:
             self._signal_group(proc_to_stop, signal.SIGINT)
         return {
             "action": "scheduled", "device_state": self._state.state,
-            "reset_epoch": epoch, "breakage": breakage,
+            "reset_epoch": epoch,
             "hint": "Reset is scheduled before the next job.",
-        }
-
-    @staticmethod
-    def _job_ref(job: Job | None) -> dict[str, Any] | None:
-        if job is None:
-            return None
-        return {
-            "id": job.id, "cmd": job.cmd, "cwd": job.cwd,
-            "client": job.client_id, "mode": job.mode, "status": job.status,
-            "exit_code": job.exit_code, "output_file": job.output_file,
-            "submitted_at": format_timestamp(job.submitted),
-            "started_at": format_timestamp(job.started_at),
-            "finished_at": format_timestamp(job.finished_at),
         }
 
     def _worker_loop(self) -> None:
@@ -1286,14 +1220,6 @@ class DeviceQueue:
                 self._state.state = "dead"
                 self._state.dead_since = now
                 self._state.dead_reason = REBOOT_REQUIRED_MSG
-            if self._state.last_breakage:
-                self._state.last_breakage.update({
-                    "reset_job": self._job_ref(job),
-                    "reset_finished_at": format_timestamp(now),
-                    "reset_result": (
-                        "interrupted" if interrupted else ("healthy" if healthy else "dead")
-                    ),
-                })
             self._persist_state()
             self._cond.notify_all()
         if interrupted:
@@ -1316,8 +1242,6 @@ class DeviceQueue:
         with self._lock:
             self._jobs[job.id] = job
             self._current = job
-            if self._state.last_breakage:
-                self._state.last_breakage["reset_job"] = self._job_ref(job)
         return job
 
     def _run_control(self, command: str, log: BoundedJobLog) -> int:

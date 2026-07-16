@@ -17,8 +17,8 @@ The MCP tools retain their names and primary arguments:
 - `kill(job_id="")`
 - `reset(job_id="")`
 
-The HTTP service retains `POST /queue`, `/cancel`, `/kill`, `/reset` and
-`GET /status`, `/breakage`, `/job/<id>`, `/logs/<id>`, `/result/<id>`.
+The HTTP service provides `POST /queue`, `/kill`, `/reset` and
+`GET /status`, `/job/<id>`, `/logs/<id>`, `/result/<id>`.
 Responses add worker-health and log-truncation fields but preserve the original
 fields used by the MCP adapter.
 
