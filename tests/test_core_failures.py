@@ -47,7 +47,7 @@ class CoreFailureTest(unittest.TestCase):
         deadline = time.time() + 3
         while time.time() < deadline:
             stored = self.queue.get_job(job.id)
-            if stored and stored.status == "done":
+            if stored and stored.status == "done" and job.id not in self.queue._jobs:
                 break
             time.sleep(0.01)
         self.assertEqual(self.queue.get_job(job.id).status, "done")

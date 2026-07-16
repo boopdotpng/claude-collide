@@ -10,7 +10,7 @@
 4. A same-boot restart preserves `dead`, reset epoch, and an interrupted reset.
 5. The worker stops dispatching when durable state cannot be updated. Dirty
    transitions are retried before dispatch resumes.
-6. Memory, request bodies, queue depth, log reads, stored output, and MCP result
+6. Memory, request bodies, queue depth, log reads, stored output, and CLI result
    output are bounded by configuration.
 
 ## Scheduling

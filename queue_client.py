@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small synchronous client shared by CLI-style callers and the MCP adapter."""
+"""Small synchronous HTTP client used by the command-line interface."""
 
 from __future__ import annotations
 
